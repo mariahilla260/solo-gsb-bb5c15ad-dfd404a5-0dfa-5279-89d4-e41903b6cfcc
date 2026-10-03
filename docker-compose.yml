@@ -1,0 +1,32 @@
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-coldchain}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-coldchain}
+      POSTGRES_DB: ${POSTGRES_DB:-coldchain}
+    volumes:
+      # 仅首次启动（数据卷为空）时执行：创建枚举类型与表结构（数据库初始化）
+      - ./db/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      # 便于宿主机直接连接调试，不需要可删除
+      - "${DB_PORT:-5432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-coldchain} -d ${POSTGRES_DB:-coldchain}"]
+      interval: 3s
+      timeout: 3s
+      retries: 20
+
+  api:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+psycopg2://${POSTGRES_USER:-coldchain}:${POSTGRES_PASSWORD:-coldchain}@db:5432/${POSTGRES_DB:-coldchain}
+    ports:
+      - "${API_PORT:-8000}:8000"
+    depends_on:
+      db:
+        condition: service_healthy
+
+volumes:
+  pgdata:
