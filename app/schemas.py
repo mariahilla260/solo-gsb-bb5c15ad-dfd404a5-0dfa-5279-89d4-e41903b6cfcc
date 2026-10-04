@@ -396,6 +396,14 @@ class PrecheckReadingCoverage(BaseModel):
         ..., description="当前有效温度（含测温更正）"
     )
     version: int = Field(..., description="该读数的当前更正版本（0=原始值）")
+    quarantined: bool = Field(
+        ...,
+        description="该读数是否被本车次生效探头故障覆盖（被覆盖则不参与实际"
+        "越温重建，列此仅供参考）",
+    )
+    covering_fault_ids: list[str] = Field(
+        ..., description="覆盖该读数的生效故障编号（未覆盖为空列表）"
+    )
 
 
 class PrecheckRisk(BaseModel):
@@ -410,6 +418,14 @@ class PrecheckRisk(BaseModel):
         ...,
         description="该货物在读数时刻是否有自有测温（同刻自有优先，"
         "为 true 时车载读数对该货物实际被取代，风险仅供参考）",
+    )
+    quarantined: bool = Field(
+        ...,
+        description="该读数是否被生效探头故障覆盖（被覆盖则不参与实际重建，"
+        "风险仅供参考）",
+    )
+    covering_fault_ids: list[str] = Field(
+        ..., description="覆盖该读数的生效故障编号（未覆盖为空列表）"
     )
 
 
@@ -530,20 +546,76 @@ class ReadingApplication(BaseModel):
     on_board: bool = Field(..., description="读数时刻该货物是否仍在车上（左闭右开）")
     adopted: bool = Field(
         ...,
-        description="是否被该货物越温时间线采用：在车上且同刻无自有测温时为 true",
+        description="是否被该货物越温时间线采用：在车上且同刻无自有测温、"
+        "且未被生效探头故障覆盖时为 true",
     )
     over_limit: bool | None = Field(
         ...,
-        description="按该货物自身温度上限是否越温；不在车上时为 null"
+        description="按该货物自身温度上限是否越温（按当前有效温度判定，"
+        "仅供查阅）；不在车上时为 null。被故障隔离的读数仍给出其温度判定",
+    )
+    quarantined: bool = Field(
+        ...,
+        description="是否被生效探头故障覆盖而隔离（不参与越温重建）；"
+        "不在车上时恒为 false",
+    )
+    covering_fault_ids: list[str] = Field(
+        ...,
+        description="覆盖该读数时刻的生效故障编号（在车且被覆盖时非空；按编号排序）",
     )
     reason: str = Field(
         ...,
         description="未采用原因：adopted=已采用 / not_on_board=不在车上 / "
-        "supplanted_by_own=同刻有货物自有测温（原始读数仍可查）"
+        "supplanted_by_own=同刻有货物自有测温 / quarantined=被生效探头故障覆盖"
+        "（原始读数仍可查）。同时被故障覆盖且同刻有自有测温时优先标记 "
+        "supplanted_by_own（covering_fault_ids 仍给出覆盖故障）",
+    )
+
+
+class ProbeFaultRevocationOut(BaseModel):
+    """一条故障撤销记录（append-only 留痕）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    revocation_id: str
+    fault_id: str
+    trip_id: str
+    expected_version: int
+    version: int = Field(..., description="撤销后的故障版本（= expected_version + 1）")
+    revoked_at: datetime = Field(..., description="撤销发生时刻（UTC）")
+    created_at: datetime
+
+
+class ProbeFaultOut(BaseModel):
+    """一条探头故障登记及其撤销状态（登记与撤销均留痕）。"""
+
+    model_config = ConfigDict(from_attributes=True)
+
+    fault_id: str
+    trip_id: str
+    fault_start: datetime = Field(..., description="故障时段起点（含，UTC）")
+    fault_end: datetime = Field(..., description="故障时段终点（不含，UTC）")
+    reason: str
+    version: int = Field(
+        ...,
+        description="故障版本：0=已登记未撤销；1=已撤销（撤销的乐观锁以此为准）",
+    )
+    active: bool = Field(..., description="是否生效（未撤销）")
+    created_at: datetime
+    revocation: ProbeFaultRevocationOut | None = Field(
+        ..., description="撤销记录；未撤销时为 null"
     )
 
 
 class TripReadingOut(VehicleReadingOut):
+    quarantined: bool = Field(
+        ...,
+        description="该读数是否被本车次的生效探头故障覆盖（读数时刻落在未撤销"
+        "故障时段内）：被覆盖即不参与任何在车货物的越温重建，原始读数仍可查",
+    )
+    covering_fault_ids: list[str] = Field(
+        ..., description="覆盖该读数的本车次生效故障编号（未覆盖为空列表）"
+    )
     applications: list[ReadingApplication] = Field(
         ..., description="对车次上各票已登记货物的适用性，按货物编号排序"
     )
@@ -554,6 +626,11 @@ class TripDetail(TripOut):
 
     loadings: list[LoadingOut]
     readings: list[TripReadingOut]
+    faults: list[ProbeFaultOut] = Field(
+        ...,
+        description="本车次的探头故障登记（含已撤销，按故障开始时刻升序）；"
+        "生效故障覆盖的车载读数不参与越温重建",
+    )
 
 
 class TimelinePointOut(BaseModel):
@@ -580,7 +657,17 @@ class TimelinePointOut(BaseModel):
     receiver: str | None
     adopted: bool = Field(
         ...,
-        description="车载读数是否被采用：同刻有自有测温时为 false（原始仍可查）"
+        description="车载读数是否被采用：同刻有自有测温或被生效探头故障覆盖时"
+        "为 false（原始读数仍可查）",
+    )
+    quarantined: bool = Field(
+        ...,
+        description="车载读数是否因被生效探头故障覆盖而隔离"
+        "（不参与越温重建；自有 / 交接点恒为 false）",
+    )
+    covering_fault_ids: list[str] = Field(
+        ...,
+        description="覆盖该车载读数的生效故障编号（仅车载点；未隔离为空列表）",
     )
     changes_holder: bool = Field(
         ..., description="是否为改变保管方的交接（仅自有交接为 true）"
@@ -839,6 +926,103 @@ class LoadingCorrectionHistory(BaseModel):
     corrections: list[LoadingCorrectionOut] = Field(
         ..., description="历次更正（append-only），按版本升序"
     )
+
+
+# ----------------------------------------------------- 车次探头故障（请求 / 回执）
+
+
+class ProbeFaultCreate(BaseModel):
+    """车次探头故障登记：故障编号 + 左闭右开带时区时段 + 原因（车次取自路径）。"""
+
+    fault_id: str = Field(
+        ..., min_length=1, max_length=64, description="故障编号（客户端指定）"
+    )
+    trip_id: str | None = Field(default=None, max_length=64)
+    fault_start: datetime = Field(
+        ...,
+        description="故障时段起点（含），ISO 8601 且必须显式携带时区偏移",
+    )
+    fault_end: datetime = Field(
+        ...,
+        description="故障时段终点（不含，左闭右开），必须严格晚于起点且带时区",
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=512, description="故障原因（必填非空）"
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("故障原因 reason 不能为空白")
+        return value.strip()
+
+
+class ProbeFaultAck(BaseModel):
+    """故障登记回执：故障记录 + 本次隔离的车载读数 / 受影响货物。"""
+
+    fault: ProbeFaultOut
+    quarantined_reading_ids: list[str] = Field(
+        ...,
+        description="故障时段内的车次车载读数：任一生效故障覆盖即隔离，"
+        "不参与货物越温重建（晚到读数同样隔离，按重建时生效故障判定）",
+    )
+    affected_cargo_ids: list[str] = Field(
+        ...,
+        description="故障时段内在车上的货物（装卸窗口与故障时段相交，按编号排序）",
+    )
+
+
+class ProbeFaultReplay(ProbeFaultAck):
+    """同故障编号同请求重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    message: str
+
+
+class ProbeFaultRevokeCreate(BaseModel):
+    """故障撤销：撤销编号 + 故障编号 + 期望版本（车次取自路径）。"""
+
+    revocation_id: str = Field(
+        ..., min_length=1, max_length=64, description="撤销编号（客户端指定）"
+    )
+    fault_id: str = Field(..., min_length=1, max_length=64, description="被撤销故障编号")
+    trip_id: str | None = Field(default=None, max_length=64)
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="预期的故障当前版本（登记后为 0）；不一致或故障已撤销"
+        "则拒绝（stale_fault_version）",
+    )
+
+
+class ProbeFaultRevokeAck(BaseModel):
+    """故障撤销回执：撤销记录 + 撤销后恢复采用的读数。"""
+
+    revocation: ProbeFaultRevocationOut
+    fault: ProbeFaultOut
+    restored_reading_ids: list[str] = Field(
+        ...,
+        description="撤销后恢复参与重建的车载读数：故障时段内且不再被任何"
+        "其它生效故障覆盖的读数（按当前有效温度恢复，同刻自有测温仍优先）",
+    )
+    affected_cargo_ids: list[str] = Field(
+        ..., description="故障时段内在车上的货物（按编号排序）"
+    )
+
+
+class ProbeFaultRevokeReplay(ProbeFaultRevokeAck):
+    """同撤销编号同请求重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    message: str
+
+
+class ProbeFaultList(BaseModel):
+    """车次的故障登记列表（含已撤销，按故障开始时刻升序）。"""
+
+    trip_id: str
+    faults: list[ProbeFaultOut]
 
 
 # ----------------------------------------------------- 责任证据封存

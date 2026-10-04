@@ -40,7 +40,12 @@ from app.models import (
 )
 from app.schemas import CorrectionCreate
 from app.timeutil import ensure_utc
-from app.vehicle_crud import _affected_cargo_ids, _load_trip_locked, _lock_cargo_rows
+from app.vehicle_crud import (
+    _affected_cargo_ids,
+    _bump_trip_revision,
+    _load_trip_locked,
+    _lock_cargo_rows,
+)
 
 
 def _conflict(message: str, code: str) -> ApiError:
@@ -174,8 +179,26 @@ def submit_correction(db, payload: CorrectionCreate) -> CorrectionResult:
     try:
         return _submit_tx(db, payload)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
+        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
+        # OperationalError 也可能在 commit 已落库后抛出——重放前先按编号幂等
+        # 检测（车载更正含车次修订号 +1，重复执行会多递增），已落库则返回原结果。
         db.rollback()
+        target_type = payload.target_type_enum()
+        winner = db.get(TemperatureCorrection, payload.correction_id)
+        if winner is not None and _same_content(
+            winner,
+            target_type,
+            payload.target_id,
+            payload.expected_version,
+            Decimal(payload.new_temperature),
+        ):
+            if winner.target_type is CorrectionTarget.own_event:
+                cargo_ids = [winner.cargo_id]
+            else:
+                cargo_ids = _affected_cargo_ids(
+                    db, winner.trip_id, _reading_at(db, winner.target_reading_id)
+                )
+            return _replay_view(winner, cargo_ids)
         return _submit_tx(db, payload)
 
 
@@ -423,7 +446,7 @@ def _submit_vehicle_reading(
     )
     db.add(row)
     # 车载读数更正在该车次落库 -> 车次修订号 +1（同事务，版本过期回滚则不递增）
-    trip.revision = (trip.revision or 0) + 1
+    _bump_trip_revision(db, trip)
     db.flush()
     return CorrectionResult(
         correction=row,

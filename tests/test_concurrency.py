@@ -387,6 +387,81 @@ def test_concurrent_loading_correction_and_event_write_serialize(client):
     assert len(hist["corrections"]) == 1
 
 
+def test_concurrent_probe_fault_and_reading_write_serialize(client):
+    """探头故障登记与该车次车载读数写入共用货物行锁 + 车次行锁，必须串行。
+
+    8 个线程并发登记同一故障（编号相同、同请求），一笔 201，其余幂等 200；
+    车次修订号对故障只 +1（读数写入各 +1，分别断言）。同时并发补录故障时段
+    内的车载读数，全部请求不得出现 5xx，且最终视图确定：故障生效，时段内
+    读数一律隔离。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CPF",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TPF", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TPF/manifest",
+        json={"items": [{
+            "cargo_id": "CPF",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T12:00:00+00:00",
+        }]},
+    ).status_code == 201
+    revision_before = client.get("/trips/TPF").json()["revision"]
+
+    fault_body = {
+        "fault_id": "pf-same",
+        "fault_start": "2026-01-01T10:30:00+00:00",
+        "fault_end": "2026-01-01T11:30:00+00:00",
+        "reason": "并发同一故障",
+    }
+
+    def submit_fault(_):
+        return client.post("/trips/TPF/probe-faults", json=fault_body).status_code
+
+    def submit_reading(i):
+        # 读数时刻落在故障时段内；同车次同刻至多一笔，不同时刻各写各的
+        return client.post(
+            "/vehicle-readings",
+            json={
+                "reading_id": f"pf-vr-{i}",
+                "trip_id": "TPF",
+                "read_at": f"2026-01-01T10:{40+i:02d}:00+00:00",
+                "temperature": "9",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_faults = [pool.submit(submit_fault, i) for i in range(8)]
+        f_readings = [pool.submit(submit_reading, i) for i in range(4)]
+        fault_codes = [f.result() for f in f_faults]
+        reading_codes = [f.result() for f in f_readings]
+
+    assert fault_codes.count(201) == 1
+    assert fault_codes.count(200) == 7
+    assert reading_codes.count(201) == 4
+    # 故障恰好成功一次 -> 因故障 +1；4 笔读数各 +1（顺序不影响总数）
+    assert client.get("/trips/TPF").json()["revision"] == revision_before + 5
+
+    faults = client.get("/trips/TPF/probe-faults").json()["faults"]
+    assert len(faults) == 1 and faults[0]["active"] is True
+
+    # 故障生效：时段内全部读数隔离，不产生越温区间
+    tl = client.get("/cargo/CPF/timeline").json()["points"]
+    veh = [p for p in tl if p["source"] == "vehicle"]
+    assert len(veh) == 4
+    assert all(p["quarantined"] and not p["adopted"] for p in veh)
+    assert client.get("/cargo/CPF/report").json()["excursions"] == []
+
+
 def test_concurrent_seal_and_event_write_serialize(client):
     """封存与同货物的事件写入共用货物行锁：
 

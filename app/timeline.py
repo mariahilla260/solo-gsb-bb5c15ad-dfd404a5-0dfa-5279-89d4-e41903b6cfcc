@@ -6,11 +6,15 @@
   ``[loaded_at, unloaded_at)`` 且 ``loaded_at <= 读数时刻 < unloaded_at``（左闭右开）。
 * 同一时刻该货物有自有测温时，**优先采用自有测温**；车载读数在该时刻对该货物
   标记 ``adopted=False``（被取代），不参与越温重建，但原始读数仍可查询。
+* **生效探头故障覆盖的车载读数一律隔离**：读数所属车次存在未撤销故障且读数
+  时刻落在其左闭右开故障时段内时，该读数对在车货物标记 ``adopted=False`` /
+  ``quarantined=True`` 并附覆盖故障编号，不参与越温重建（原始读数仍可查）；
+  撤销最后一条覆盖故障后恢复按当前有效温度采用（同刻自有测温仍优先）。
 * 交接事件只来自货物自有事件，车载读数从不改变保管方。
 * **测温更正生效于有效温度**：测温点的温度取该自有测温 / 车载读数最新一次
   更正后的有效温度（无更正时为原始温度）。同刻自有测温优先仍只取决于“该时刻
-  是否存在自有测温”，与温度取值无关；被取代的车载点同样携带更正后的有效温度
-  与版本（仅用于展示，不参与重建）。
+  是否存在自有测温”，与温度取值无关；被取代 / 被隔离的车载点同样携带更正后的
+  有效温度与版本（仅用于展示，不参与重建）。
 """
 from __future__ import annotations
 
@@ -51,8 +55,9 @@ def merged_timeline(
     loadings,
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
+    reading_quarantine: dict[str, tuple] | None = None,
 ) -> list[TimelinePoint]:
-    """生成货物的完整读数时间线（含被取代的车载点，按时间升序）。
+    """生成货物的完整读数时间线（含被取代 / 被隔离的车载点，按时间升序）。
 
     :param own_events: 该货物的全部自有事件（测温 / 交接）。
     :param vehicle_readings: 该货物所有车次的车载原始读数（可含与其无关车次的，
@@ -61,9 +66,15 @@ def merged_timeline(
     :param event_effective: 自有测温事件ID -> ``(有效温度, 版本)``，
         仅含发生过更正的测温；缺失即原始温度、版本 0。
     :param reading_effective: 车载读数ID -> ``(有效温度, 版本)``，语义同上。
+    :param reading_quarantine: 车载读数ID -> 覆盖该读数的**生效探头故障**
+        编号元组（仅被覆盖的读数有键）。被覆盖的在车读数标记隔离、不参与
+        重建；覆盖故障编号随点输出。隔离与“同刻自有测温优先”相互独立——
+        同刻有自有测温的读数即使也被故障覆盖，仍标 ``quarantined=True``
+        但 adopted 的首要原因是被自有测温取代。
     """
     event_effective = event_effective or {}
     reading_effective = reading_effective or {}
+    reading_quarantine = reading_quarantine or {}
 
     points: list[TimelinePoint] = []
     own_measure_at = set()
@@ -95,6 +106,7 @@ def merged_timeline(
             temperature, r_version = Decimal(eff[0]), eff[1]
         else:
             temperature, r_version = Decimal(r.temperature), 0
+        covers = tuple(reading_quarantine.get(r.reading_id, ()))
         points.append(
             TimelinePoint(
                 occurred_at=r.read_at,
@@ -103,8 +115,10 @@ def merged_timeline(
                 source=SOURCE_VEHICLE,
                 source_id=r.reading_id,
                 trip_id=r.trip_id,
-                adopted=r.read_at not in own_measure_at,
+                # 同刻自有测温优先；被生效故障覆盖的读数也不参与重建
+                adopted=r.read_at not in own_measure_at and not covers,
                 temp_version=r_version,
+                quarantine_faults=covers,
             )
         )
     points.sort(
@@ -124,6 +138,7 @@ def adopted_timeline(
     loadings,
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
+    reading_quarantine: dict[str, tuple] | None = None,
 ) -> list[TimelinePoint]:
     """只含被采用点的时间线，供保管链重建使用。"""
     return [
@@ -134,20 +149,26 @@ def adopted_timeline(
             loadings,
             event_effective,
             reading_effective,
+            reading_quarantine,
         )
         if p.adopted
     ]
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数与测温更正有效值。
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值与
+    生效探头故障隔离映射。
 
-    返回 ``(events, loadings, readings, effective)``；``effective`` 为
-    ``(event_effective, reading_effective)`` 两个映射，键分别为自有测温事件ID
-    与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过更正的目标。
+    返回 ``(events, loadings, readings, effective, quarantine)``；
+    ``effective`` 为 ``(event_effective, reading_effective)`` 两个映射，键分别
+    为自有测温事件ID与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过
+    更正的目标；``quarantine`` 为车载读数ID -> 覆盖该读数的生效故障编号元组
+    （仅含被该读数所属车次生效故障覆盖的读数；是否在车由合并阶段按装卸时段
+    再判定）。
     """
     from sqlalchemy import select
 
+    from app import faults as faults_mod
     from app.models import Event, Loading, TemperatureCorrection, Trip, VehicleReading
     from app.timeutil import ensure_utc
 
@@ -173,6 +194,7 @@ def load_cargo_context(db, cargo_id: str):
         l.unloaded_at = ensure_utc(l.unloaded_at)
 
     readings: list = []
+    quarantine: dict[str, tuple] = {}
     if loadings:
         trip_ids = {l.trip_id for l in loadings}
         rows = list(
@@ -187,6 +209,10 @@ def load_cargo_context(db, cargo_id: str):
         # 仅按关系惰性引用，trip 行由车次查询单独获取
         readings = rows
 
+        # 相关车次的生效探头故障：覆盖的车载读数一律隔离（与在车判定独立）
+        active = faults_mod.load_active_faults(db, trip_ids)
+        quarantine = faults_mod.reading_quarantine_map(readings, active)
+
     effective = load_effective_maps(
         db,
         event_ids={
@@ -195,7 +221,7 @@ def load_cargo_context(db, cargo_id: str):
         },
         reading_ids={r.reading_id for r in readings},
     )
-    return events, loadings, readings, effective
+    return events, loadings, readings, effective, quarantine
 
 
 def load_effective_maps(db, event_ids=None, reading_ids=None):

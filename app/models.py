@@ -14,7 +14,7 @@ from sqlalchemy import (
     Text,
     text,
 )
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.database import Base
 
@@ -468,6 +468,95 @@ class LoadingCorrection(Base):
         nullable=False,
         default=lambda: datetime.now(timezone.utc),
     )
+
+
+class ProbeFault(Base):
+    """车次探头故障登记（append-only 留痕；撤销以独立撤销行标记，不删不改）。
+
+    质控人员在探头被证实失准后，凭故障编号、车次、带时区的起止时刻与原因
+    登记一个**左闭右开**故障时段 ``[fault_start, fault_end)``。故障与车次
+    绑定、与装卸时段无关：任一生效（未撤销）故障覆盖的车载读数都不参与
+    货物越温重建——读数时刻落在故障时段内的读数对每票在车货物一律隔离；
+    重叠故障中撤销一条后，其余生效故障覆盖的读数仍隔离。撤销只经
+    :class:`ProbeFaultRevocation` 追加撤销行（期望版本乐观锁），登记与撤销
+    均留痕、可查。成功登记 / 撤销在同一事务内把车次修订号 +1
+    （旧装卸预检摘要随之失效）。
+    """
+
+    __tablename__ = "probe_fault"
+    __table_args__ = (
+        CheckConstraint(
+            "fault_start < fault_end "
+            "AND reason IS NOT NULL AND char_length(reason) > 0",
+            name="chk_probe_fault_shape",
+        ),
+        Index("ix_probe_fault_trip_time", "trip_id", "fault_start", "fault_end"),
+    )
+
+    fault_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    trip_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trip.trip_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    fault_start: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    fault_end: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    # 故障版本：0=仅登记未撤销；撤销成功后为 1（= 撤销行数，乐观锁）
+    version: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    # 一对一撤销行（不存在=生效；存在=已撤销）
+    revocation: Mapped["ProbeFaultRevocation | None"] = relationship(
+        back_populates="fault", lazy="selectin"
+    )
+
+
+class ProbeFaultRevocation(Base):
+    """车次探头故障撤销（append-only）：凭撤销编号 + 期望版本撤销一条故障。
+
+    每条故障至多一条撤销行（``fault_id`` 唯一）；撤销成功后该故障不再生效，
+    被其**唯一**覆盖（其余生效故障均不覆盖）的车载读数恢复按当前有效温度
+    参与重建（同刻自有测温仍优先）。撤销编号用于幂等 / 冲突裁决：同编号同
+    请求重传返回原结果，异请求冲突。
+    """
+
+    __tablename__ = "probe_fault_revocation"
+    __table_args__ = (
+        CheckConstraint(
+            "expected_version >= 0 AND version = expected_version + 1",
+            name="chk_probe_fault_revocation_shape",
+        ),
+    )
+
+    revocation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fault_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("probe_fault.fault_id", ondelete="RESTRICT"),
+        nullable=False,
+        unique=True,
+    )
+    trip_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    revoked_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+    fault: Mapped["ProbeFault"] = relationship(back_populates="revocation")
 
 
 class EvidenceSeal(Base):

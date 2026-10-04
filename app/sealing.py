@@ -164,6 +164,7 @@ def scoped_evidence(
     start_bound,
     span_end,
     apply_window_filter: bool = True,
+    reading_quarantine: dict | None = None,
 ):
     """按时间范围归集重建证据（封存与现况对照共用同一定义）。
 
@@ -174,10 +175,14 @@ def scoped_evidence(
     :param apply_window_filter: 自有事件是否同样施加下界——封存与对照的
         自有事件均取“不晚于闭合时刻”的**全部**事件（含开启前完整保管链，
         下界置 False）；车载读数 / 装卸窗口恒按下界与上界归集。
+    :param reading_quarantine: 车载读数ID -> 覆盖该读数的**生效探头故障**
+        编号元组；被覆盖的读数不参与越温重建，故不计入重建证据（封存现况
+        对照中表现为该读数 ``removed``，封存原包不被改写）。
     :returns: ``(own_event_items, reading_items, loading_items)`` 规范化字典，
         分别按 事件ID / (读数时刻, 读数ID) / (车次, 原装车时刻) 升序。
     """
     event_effective, reading_effective = effective
+    reading_quarantine = reading_quarantine or {}
 
     lower = ensure_utc(start_bound) if start_bound is not None else None
 
@@ -201,13 +206,16 @@ def scoped_evidence(
 
     # 车载读数：对该货物适用（同车次 + 当前窗口左闭右开在车）且读数时刻
     # 落在范围内；被同刻自有测温取代的原始读数同样封存（adopted=false），
-    # 以完整保留“同刻自有优先”的重建上下文。
+    # 以完整保留“同刻自有优先”的重建上下文。**被生效探头故障覆盖的读数不
+    # 参与重建**，不计入证据项（封存后登记故障时于对照接口表现为 removed）。
     reading_items = []
     for r in readings:
         read_at = ensure_utc(r.read_at)
         if lower is not None and read_at < lower:
             continue
         if span_end is not None and read_at > span_end:
+            continue
+        if r.reading_id in reading_quarantine:
             continue
         applicable = any(timeline.is_reading_applicable(l, r) for l in loadings)
         if not applicable:
@@ -287,6 +295,7 @@ def build_seal_payload(
     loadings,
     effective,
     sealed_at,
+    reading_quarantine: dict | None = None,
 ) -> SealPayload:
     """在一个一致的已提交视图上组装封存包并计算内容摘要。
 
@@ -294,6 +303,8 @@ def build_seal_payload(
     :param interval_view: :meth:`responsibility.build_interval_view` 的视图
         （提供当时各责任方最新有效表态）。
     :param sealed_at: 封存时刻（datetime，统一转 UTC 秒级）。
+    :param reading_quarantine: 车载读数ID -> 生效探头故障编号元组；
+        被覆盖的读数不参与重建，不计入封存证据。
     """
     start, end = ensure_utc(ex.start), ensure_utc(ex.end)
     # 封存自有事件取“不晚于闭合时刻”的全部事件（含开启前完整保管链，
@@ -306,6 +317,7 @@ def build_seal_payload(
         start,
         end,
         apply_window_filter=False,
+        reading_quarantine=reading_quarantine,
     )
 
     sealed_at_s = ts(sealed_at)
@@ -356,16 +368,17 @@ class CurrentState:
     readings: list
     loadings: list
     effective: tuple
+    quarantine: dict                 # 车载读数ID -> 生效探头故障编号元组
 
 
 def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
     """按当前数据重建目标区间状态（读事务内调用；不抛 404/422）。"""
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo.cargo_id
+    events, loadings, readings, effective, quarantine = (
+        timeline.load_cargo_context(db, cargo.cargo_id)
     )
     cargo_start = ensure_utc(cargo.started_at)
     chain_result, closed = resp.rebuild(
-        cargo, events, loadings, readings, effective
+        cargo, events, loadings, readings, effective, quarantine
     )
     ex = closed.get(interval_key)
     open_ex = next(
@@ -375,6 +388,14 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
 
     from app import stance_crud
 
+    common = dict(
+        cargo_start=cargo_start,
+        events=events,
+        readings=readings,
+        loadings=loadings,
+        effective=effective,
+        quarantine=quarantine,
+    )
     if ex is not None:
         rows = stance_crud.load_interval_stances(
             db, cargo.cargo_id, interval_key
@@ -386,11 +407,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
             open_ex=None,
             current_snapshot_id=resp.snapshot_id(ex),
             current_view=view,
-            cargo_start=cargo_start,
-            events=events,
-            readings=readings,
-            loadings=loadings,
-            effective=effective,
+            **common,
         )
     if open_ex is not None:
         return CurrentState(
@@ -399,11 +416,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
             open_ex=open_ex,
             current_snapshot_id=None,
             current_view=None,
-            cargo_start=cargo_start,
-            events=events,
-            readings=readings,
-            loadings=loadings,
-            effective=effective,
+            **common,
         )
     return CurrentState(
         status=STATUS_DISAPPEARED,
@@ -411,11 +424,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
         open_ex=None,
         current_snapshot_id=None,
         current_view=None,
-        cargo_start=cargo_start,
-        events=events,
-        readings=readings,
-        loadings=loadings,
-        effective=effective,
+        **common,
     )
 
 
@@ -477,7 +486,8 @@ def _current_evidence(state: CurrentState, start_bound, span_end):
     """按封存相同的范围定义归集当前证据。
 
     自有事件与封存一致：不施下界（不晚于上界的全部事件——含开启前保管链），
-    ``start_bound`` 只约束车载读数与装卸窗口。
+    ``start_bound`` 只约束车载读数与装卸窗口。被生效探头故障覆盖的读数不
+    参与重建，不计入当前证据（对照中记为 removed）。
     """
     return scoped_evidence(
         state.events,
@@ -487,6 +497,7 @@ def _current_evidence(state: CurrentState, start_bound, span_end):
         start_bound,
         span_end,
         apply_window_filter=False,
+        reading_quarantine=state.quarantine,
     )
 
 

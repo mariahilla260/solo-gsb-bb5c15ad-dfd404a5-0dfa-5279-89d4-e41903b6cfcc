@@ -17,7 +17,9 @@ from app import (
     correction_crud,
     crud,
     evidence_crud,
+    faults as faults_mod,
     loading_correction_crud,
+    probe_fault_crud,
     responsibility,
     sealing,
     stance_crud,
@@ -29,6 +31,7 @@ from app.models import (
     Cargo,
     Event,
     Loading,
+    ProbeFault,
     Stance,
     StanceKind,
     Trip,
@@ -49,6 +52,15 @@ from app.schemas import (
     EvidenceSealCreate,
     EvidenceSealOut,
     EvidenceSealReplay,
+    ProbeFaultAck,
+    ProbeFaultCreate,
+    ProbeFaultList,
+    ProbeFaultOut,
+    ProbeFaultReplay,
+    ProbeFaultRevocationOut,
+    ProbeFaultRevokeAck,
+    ProbeFaultRevokeCreate,
+    ProbeFaultRevokeReplay,
     SealCargo,
     SealDiffItem,
     SealDiffReport,
@@ -217,6 +229,46 @@ async def lifespan(app: FastAPI):
                 "CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval "
                 "ON evidence_seal (cargo_id, interval_key)"
             )
+            # 5) 车次探头故障登记 / 撤销表（新表，IF NOT EXISTS 兜底；append-only）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS probe_fault (
+                    fault_id     VARCHAR(64)   PRIMARY KEY,
+                    trip_id      VARCHAR(64)   NOT NULL
+                                 REFERENCES trip(trip_id) ON DELETE RESTRICT,
+                    fault_start  TIMESTAMPTZ   NOT NULL,
+                    fault_end    TIMESTAMPTZ   NOT NULL,
+                    reason       VARCHAR(512)  NOT NULL,
+                    version      INTEGER       NOT NULL DEFAULT 0,
+                    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
+                    CONSTRAINT chk_probe_fault_shape CHECK (
+                        fault_start < fault_end
+                        AND char_length(reason) > 0
+                    )
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_probe_fault_trip_time "
+                "ON probe_fault (trip_id, fault_start, fault_end)"
+            )
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS probe_fault_revocation (
+                    revocation_id    VARCHAR(64) PRIMARY KEY,
+                    fault_id         VARCHAR(64) NOT NULL UNIQUE
+                                     REFERENCES probe_fault(fault_id) ON DELETE RESTRICT,
+                    trip_id          VARCHAR(64) NOT NULL,
+                    expected_version INTEGER     NOT NULL,
+                    version          INTEGER     NOT NULL,
+                    revoked_at       TIMESTAMPTZ NOT NULL,
+                    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+                    CONSTRAINT chk_probe_fault_revocation_shape CHECK (
+                        expected_version >= 0 AND version = expected_version + 1
+                    )
+                )
+                """
+            )
     yield
 
 
@@ -239,8 +291,15 @@ app = FastAPI(
         "内容摘要，封存后不可改；区间消失/重开/快照已变拒绝且不留记录，"
         "同案件编号同请求重试即使现况已变仍返回原包，并支持封存包查询与"
         "现况对照（证据项/责任片段增删变更，晚到记录与更正不改写原包）。"
+        "车次探头被证实失准时可登记左闭右开故障时段并凭撤销编号与期望版本"
+        "撤销（登记与撤销均留痕）：生效故障覆盖的车载读数（含晚到读数）不"
+        "参与越温重建，重叠故障撤销一条后另一条仍隔离，撤销最后一条覆盖故障"
+        "后按当前有效温度恢复采用（同刻自有测温仍优先，交接不受影响）；"
+        "越温报告、责任确认与同时越温随之重算，旧表态历史与封存原包保持"
+        "原样，封存现况对照反映变化；写入与相关装卸/读数/更正/表态串行，"
+        "成功推进车次修订号使旧预检摘要失效。"
     ),
-    version="1.6.0",
+    version="1.7.0",
     lifespan=lifespan,
 )
 
@@ -453,6 +512,8 @@ def _precheck_out(result) -> ManifestPrecheckOut:
                         read_at=r.read_at,
                         effective_temperature=r.effective_temperature,
                         version=r.version,
+                        quarantined=r.quarantined,
+                        covering_fault_ids=list(r.covering_fault_ids),
                     )
                     for r in a.readings
                 ],
@@ -465,6 +526,8 @@ def _precheck_out(result) -> ManifestPrecheckOut:
                         effective_temperature=risk.effective_temperature,
                         temp_upper_limit=risk.temp_upper_limit,
                         supplanted_by_own=risk.supplanted_by_own,
+                        quarantined=risk.quarantined,
+                        covering_fault_ids=list(risk.covering_fault_ids),
                     )
                     for risk in a.risks
                 ],
@@ -601,7 +664,7 @@ def _excursion_schema(ex) -> Excursion:
 
 
 def _trip_reading_application(
-    db, reading: VehicleReading, loadings, cargos, reading_eff
+    db, reading: VehicleReading, loadings, cargos, reading_eff, reading_quarantine
 ):
     """一笔车载读数对车次上各票货物的适用性/采用情况。"""
     apps = []
@@ -627,16 +690,23 @@ def _trip_reading_application(
     # 越温判定按更正后的有效温度（原始读数仍可查）
     eff = reading_eff.get(reading.reading_id)
     eff_temp = Decimal(eff[0]) if eff is not None else Decimal(reading.temperature)
+    # 本车次生效探头故障覆盖（与货物无关，车次维度）
+    covers = list(reading_quarantine.get(reading.reading_id, ()))
 
     for cargo_id in sorted(cargo_loadings):
         on_board = any(timeline.is_on_board(l, read_at) for l in cargo_loadings[cargo_id])
-        adopted = bool(on_board and not own_at.get(cargo_id))
+        quarantined = bool(on_board and covers)
+        supplanted = bool(on_board and own_at.get(cargo_id))
+        # 同刻自有优先：被取代与被故障隔离同时成立时，首要原因标记为被自有取代
+        adopted = bool(on_board and not own_at.get(cargo_id) and not covers)
         over = None
         reason = "adopted"
         if not on_board:
             reason = "not_on_board"
         elif own_at.get(cargo_id):
             reason = "supplanted_by_own"
+        elif covers:
+            reason = "quarantined"
         if on_board:
             over = eff_temp > Decimal(cargos[cargo_id].temp_upper_limit)
         apps.append(
@@ -645,10 +715,40 @@ def _trip_reading_application(
                 on_board=on_board,
                 adopted=adopted,
                 over_limit=over,
+                quarantined=quarantined,
+                covering_fault_ids=covers,
                 reason=reason,
             )
         )
     return apps
+
+
+def _fault_out(row: ProbeFault) -> ProbeFaultOut:
+    """一条探头故障登记响应（含撤销记录与生效状态）。"""
+    revocation = row.revocation
+    return ProbeFaultOut(
+        fault_id=row.fault_id,
+        trip_id=row.trip_id,
+        fault_start=ensure_utc(row.fault_start),
+        fault_end=ensure_utc(row.fault_end),
+        reason=row.reason,
+        version=row.version or 0,
+        active=revocation is None,
+        created_at=ensure_utc(row.created_at),
+        revocation=(
+            ProbeFaultRevocationOut(
+                revocation_id=revocation.revocation_id,
+                fault_id=revocation.fault_id,
+                trip_id=revocation.trip_id,
+                expected_version=revocation.expected_version,
+                version=revocation.version,
+                revoked_at=ensure_utc(revocation.revoked_at),
+                created_at=ensure_utc(revocation.created_at),
+            )
+            if revocation is not None
+            else None
+        ),
+    )
 
 
 @app.get(
@@ -657,7 +757,7 @@ def _trip_reading_application(
     tags=["车次与车载测温"],
 )
 def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
-    """车次详情：装卸时段、车载原始读数，以及每笔读数对各货物的适用性/采用情况。"""
+    """车次详情：装卸时段、车载原始读数（含对各货物的采用 / 隔离情况）与故障登记。"""
     trip = vehicle_crud.get_trip(db, trip_id)
     loadings = vehicle_crud.get_loadings(db, trip_id)
     for l in loadings:
@@ -679,12 +779,18 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
     _, reading_eff = timeline.load_effective_maps(
         db, reading_ids={r.reading_id for r in readings}
     )
+    active_faults = faults_mod.load_active_faults(db, {trip_id})
+    reading_quarantine = faults_mod.reading_quarantine_map(
+        readings, active_faults
+    )
+    fault_rows = faults_mod.load_trip_faults(db, trip_id)
 
     trip_readings = []
     for r in readings:
         apps = _trip_reading_application(
-            db, r, loadings, cargos, reading_eff
+            db, r, loadings, cargos, reading_eff, reading_quarantine
         )
+        covers = list(reading_quarantine.get(r.reading_id, ()))
         trip_readings.append(
             TripReadingOut(
                 reading_id=r.reading_id,
@@ -702,6 +808,8 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
                     else 0
                 ),
                 created_at=ensure_utc(r.created_at),
+                quarantined=bool(covers),
+                covering_fault_ids=covers,
                 applications=apps,
             )
         )
@@ -714,7 +822,156 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
         created_at=ensure_utc(trip.created_at),
         loadings=[_loading_out(l) for l in loadings],
         readings=trip_readings,
+        faults=[_fault_out(row) for row in fault_rows],
     )
+
+
+# ---------------------------------------------------------------- 车次探头故障
+
+
+def _probe_fault_ack(result) -> ProbeFaultAck:
+    return ProbeFaultAck(
+        fault=_fault_out(result.fault),
+        quarantined_reading_ids=list(result.quarantined_reading_ids),
+        affected_cargo_ids=list(result.affected_cargo_ids),
+    )
+
+
+@app.post(
+    "/trips/{trip_id}/probe-faults",
+    response_model=ProbeFaultAck,
+    status_code=201,
+    tags=["车次探头故障"],
+    responses={
+        200: {
+            "model": ProbeFaultReplay,
+            "description": "同故障编号同请求重传：返回原结果（幂等）",
+        },
+        404: {"description": "车次不存在"},
+        409: {"description": "故障编号异内容冲突"},
+        422: {"description": "时段非法（起点不早于终点 / 缺时区 / 原因为空）"},
+    },
+)
+def register_probe_fault(
+    trip_id: str,
+    payload: ProbeFaultCreate,
+    db: Session = Depends(get_db),
+):
+    """登记车次探头故障时段（左闭右开，登记留痕）。
+
+    质控人员在探头被证实失准后，凭故障编号、带时区的起止时刻与原因登记。
+    任一生效（未撤销）故障覆盖的车载读数（读数时刻落在故障时段内）不参与
+    任何在车货物的越温重建，晚到读数同样隔离（按重建时生效故障即时判定）；
+    原始读数与温度更正历史照常可查，货物时间线 / 车次详情标明隔离状态与
+    覆盖故障。写入与相关装卸、读数、更正及表态经货物行锁 + 车次行锁串行，
+    成功后车次修订号 +1（旧装卸预检摘要失效）。同故障编号同请求重传返回
+    原结果，异内容冲突；非法时段 / 未知车次拒绝且不留部分写入。
+    """
+    # 起止时刻必须显式携带时区偏移
+    for field in ("fault_start", "fault_end"):
+        value = getattr(payload, field)
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise crud.ApiError(
+                422,
+                "timezone_required",
+                f"字段 {field} 必须携带时区偏移（如 2026-10-04T09:00:00+08:00）",
+            )
+    payload.fault_start = ensure_utc(payload.fault_start)
+    payload.fault_end = ensure_utc(payload.fault_end)
+    if payload.fault_start >= payload.fault_end:
+        raise crud.ApiError(
+            422,
+            "invalid_fault_window",
+            f"车次 {trip_id} 故障时段 "
+            f"[{payload.fault_start.isoformat()}, "
+            f"{payload.fault_end.isoformat()}) 无效："
+            "故障时段必须左闭右开且起点严格早于终点",
+        )
+    payload.trip_id = trip_id
+    result = probe_fault_crud.register_fault(db, payload)
+    ack = _probe_fault_ack(result)
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=ProbeFaultReplay(
+                **ack.model_dump(mode="json"),
+                message="相同请求的探头故障已存在，重传返回原结果（幂等）",
+            ).model_dump(mode="json"),
+        )
+    return ack
+
+
+@app.get(
+    "/trips/{trip_id}/probe-faults",
+    response_model=ProbeFaultList,
+    tags=["车次探头故障"],
+    responses={404: {"description": "车次不存在"}},
+)
+def list_probe_faults(
+    trip_id: str, db: Session = Depends(get_db)
+) -> ProbeFaultList:
+    """车次的探头故障登记列表（含已撤销；登记与撤销均留痕，按开始时刻升序）。"""
+    vehicle_crud.get_trip(db, trip_id)
+    rows = probe_fault_crud.get_trip_faults(db, trip_id)
+    return ProbeFaultList(
+        trip_id=trip_id, faults=[_fault_out(row) for row in rows]
+    )
+
+
+@app.post(
+    "/trips/{trip_id}/probe-faults/revoke",
+    response_model=ProbeFaultRevokeAck,
+    status_code=201,
+    tags=["车次探头故障"],
+    responses={
+        200: {
+            "model": ProbeFaultRevokeReplay,
+            "description": "同撤销编号同请求重传：返回原结果（幂等）",
+        },
+        404: {"description": "车次 / 故障不存在"},
+        409: {"description": "版本过期 / 撤销编号异请求冲突"},
+    },
+)
+def revoke_probe_fault(
+    trip_id: str,
+    payload: ProbeFaultRevokeCreate,
+    db: Session = Depends(get_db),
+):
+    """撤销一条车次探头故障（撤销留痕，乐观版本）。
+
+    凭撤销编号、故障编号与期望版本（故障登记后为 0，取故障查询中的
+    ``version``）撤销。撤销最后一条覆盖某读数的生效故障后，该读数按当前
+    有效温度恢复参与重建（同刻自有测温仍优先，交接不受影响）；重叠故障
+    撤销一条后，另一条覆盖的读数仍隔离。越温报告、责任确认与车次同时
+    越温结果随之重算；旧表态历史与已封存证据包保持原样，封存现况对照
+    反映变化。成功后车次修订号 +1。同撤销编号同请求重传返回原结果；
+    版本过期、故障不存在或不属于该车次拒绝且不留部分写入。
+    """
+    payload.trip_id = trip_id
+    result = probe_fault_crud.revoke_fault(db, payload)
+    ack = ProbeFaultRevokeAck(
+        revocation=ProbeFaultRevocationOut(
+            revocation_id=result.revocation.revocation_id,
+            fault_id=result.revocation.fault_id,
+            trip_id=result.revocation.trip_id,
+            expected_version=result.revocation.expected_version,
+            version=result.revocation.version,
+            revoked_at=ensure_utc(result.revocation.revoked_at),
+            created_at=ensure_utc(result.revocation.created_at),
+        ),
+        fault=_fault_out(result.fault),
+        restored_reading_ids=list(result.restored_reading_ids),
+        affected_cargo_ids=list(result.affected_cargo_ids),
+    )
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=ProbeFaultRevokeReplay(
+                **ack.model_dump(mode="json"),
+                message="相同请求的故障撤销已存在，重传返回原结果（幂等）",
+            ).model_dump(mode="json"),
+        )
+    return ack
 
 
 # ---------------------------------------------------------------- 质控：同时越温查询
@@ -840,11 +1097,16 @@ def _load_cargo(db, cargo_id: str) -> Cargo:
 def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
     """按合并读数时间线返回越温区间（含读数来源）与各责任方片段；未闭合区间标记未结束。"""
     cargo = _load_cargo(db, cargo_id)
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo_id
+    events, loadings, readings, effective, quarantine = (
+        timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.adopted_timeline(
-        events, readings, loadings, effective[0], effective[1]
+        events,
+        readings,
+        loadings,
+        effective[0],
+        effective[1],
+        quarantine,
     )
 
     result = chain.rebuild_chain(
@@ -872,11 +1134,16 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
     实际采用的读数来源；交接（``changes_holder=true``）只来自货物自有事件。
     """
     _load_cargo(db, cargo_id)
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo_id
+    events, loadings, readings, effective, quarantine = (
+        timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.merged_timeline(
-        events, readings, loadings, effective[0], effective[1]
+        events,
+        readings,
+        loadings,
+        effective[0],
+        effective[1],
+        quarantine,
     )
     return CargoTimeline(
         cargo_id=cargo_id,
@@ -893,6 +1160,10 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
                 giver=p.giver,
                 receiver=p.receiver,
                 adopted=p.adopted,
+                quarantined=(
+                    p.source == "vehicle" and bool(p.quarantine_faults)
+                ),
+                covering_fault_ids=list(p.quarantine_faults),
                 changes_holder=(not p.is_measurement),
             )
             for p in points
@@ -949,11 +1220,11 @@ def _interval_schema(view) -> ResponsibilityInterval:
 
 def _closed_interval_views(db, cargo: Cargo):
     """在合并时间线上重建并为每个已闭合区间装配责任确认视图（按开始时间升序）。"""
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo.cargo_id
+    events, loadings, readings, effective, quarantine = (
+        timeline.load_cargo_context(db, cargo.cargo_id)
     )
     result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective
+        cargo, events, loadings, readings, effective, quarantine
     )
     views = []
     for ex in sorted(closed.values(), key=lambda e: e.start):
@@ -1067,11 +1338,11 @@ def list_stance_history(
     rows = stance_crud.load_interval_stances(db, cargo_id, interval_id)
 
     # 当前区间状态（不因此报 404/422：历史要始终可查）
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo_id
+    events, loadings, readings, effective, quarantine = (
+        timeline.load_cargo_context(db, cargo_id)
     )
     chain_result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective
+        cargo, events, loadings, readings, effective, quarantine
     )
     ex = closed.get(interval_id)
     open_ex = next(

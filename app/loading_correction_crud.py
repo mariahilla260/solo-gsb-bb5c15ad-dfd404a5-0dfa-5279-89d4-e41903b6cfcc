@@ -47,6 +47,7 @@ from app.models import Loading, LoadingCorrection, Trip
 from app.schemas import LoadingWindowCorrectionCreate
 from app.timeutil import ensure_utc
 from app.vehicle_crud import (
+    _bump_trip_revision,
     _load_trip_locked,
     _lock_cargo_rows,
     _windows_overlap,
@@ -147,8 +148,25 @@ def submit_loading_correction(
     try:
         return _submit_tx(db, trip_id, payload)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
+        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
+        # OperationalError 也可能在 commit 已落库后抛出（含车次修订号 +1），
+        # 重放前先按编号幂等检测，已落库则返回原结果，避免修订号多递增。
         db.rollback()
+        winner = db.get(LoadingCorrection, payload.correction_id)
+        if (
+            winner is not None
+            and winner.trip_id == trip_id
+            and _same_content(
+                winner,
+                payload.cargo_id,
+                ensure_utc(payload.origin_loaded_at),
+                payload.expected_version,
+                ensure_utc(payload.new_loaded_at),
+                ensure_utc(payload.new_unloaded_at),
+                payload.reason,
+            )
+        ):
+            return _replay_view(winner)
         return _submit_tx(db, trip_id, payload)
 
 
@@ -283,7 +301,7 @@ def _submit_tx(
         loading.window_version = new_version
 
         # 装卸时段更正在该车次落库 -> 车次修订号 +1（失败回滚则不递增）
-        trip.revision = (trip.revision or 0) + 1
+        _bump_trip_revision(db, trip)
         db.commit()
     except ApiError:
         db.rollback()

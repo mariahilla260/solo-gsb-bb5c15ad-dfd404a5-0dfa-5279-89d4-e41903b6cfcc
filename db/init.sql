@@ -261,3 +261,44 @@ CREATE TABLE IF NOT EXISTS evidence_seal (
 
 CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval
     ON evidence_seal (cargo_id, interval_key);
+
+-- 车次探头故障登记（append-only：撤销不删不改，另以撤销行标记）。
+-- 质控人员凭故障编号、车次、带时区起止时刻与原因登记左闭右开故障时段；
+-- 任一生效（未撤销）故障覆盖的车载读数不参与货物越温重建（晚到读数同样
+-- 隔离）。version 为故障版本：0=已登记未撤销，撤销成功后为 1（乐观锁）。
+-- 故障登记 / 撤销成功在同事务使车次修订号 +1（旧装卸预检摘要失效）。
+CREATE TABLE IF NOT EXISTS probe_fault (
+    fault_id     VARCHAR(64)   PRIMARY KEY,
+    trip_id      VARCHAR(64)   NOT NULL
+                   REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    fault_start  TIMESTAMPTZ   NOT NULL,   -- 故障时段起点（含）
+    fault_end    TIMESTAMPTZ   NOT NULL,   -- 故障时段终点（不含）
+    reason       VARCHAR(512)  NOT NULL,
+    version      INTEGER       NOT NULL DEFAULT 0,
+    created_at   TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_probe_fault_shape CHECK (
+        fault_start < fault_end AND char_length(reason) > 0
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_probe_fault_trip_time
+    ON probe_fault (trip_id, fault_start, fault_end);
+
+-- 车次探头故障撤销（append-only）：凭撤销编号 + 期望版本撤销一条故障；
+-- 每条故障至多一条撤销（fault_id 唯一）。撤销最后一条覆盖读数的生效故障
+-- 后，该读数按当前有效温度恢复参与重建（同刻自有测温仍优先）。
+CREATE TABLE IF NOT EXISTS probe_fault_revocation (
+    revocation_id    VARCHAR(64) PRIMARY KEY,
+    fault_id         VARCHAR(64) NOT NULL UNIQUE
+                       REFERENCES probe_fault(fault_id) ON DELETE RESTRICT,
+    trip_id          VARCHAR(64) NOT NULL,
+    expected_version INTEGER     NOT NULL,
+    version          INTEGER     NOT NULL,
+    revoked_at       TIMESTAMPTZ NOT NULL,
+    created_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_probe_fault_revocation_shape CHECK (
+        expected_version >= 0 AND version = expected_version + 1
+    )
+);

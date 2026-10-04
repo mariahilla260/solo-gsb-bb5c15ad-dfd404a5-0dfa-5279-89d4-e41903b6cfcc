@@ -122,6 +122,22 @@ def _lock_cargo_rows(db, cargo_ids):
     return rows
 
 
+def _bump_trip_revision(db, trip: Trip) -> None:
+    """原子推进车次修订号 +1。
+
+    PostgreSQL 下事务已持车次行锁，读改写与原子 UPDATE 等价；SQLite 文件库
+    下 ``FOR UPDATE`` 为空操作，并发事务可能各自读到同一旧值导致读改写丢失
+    更新（多次写入只 +1），故统一用原子 ``revision = revision + 1`` 落库后
+    再把自增值同步回内存对象。
+    """
+    db.execute(
+        Trip.__table__.update()
+        .where(Trip.trip_id == trip.trip_id)
+        .values(revision=Trip.revision + 1)
+    )
+    db.refresh(trip, ["revision"])
+
+
 def _windows_overlap(lo1, un1, lo2, un2) -> bool:
     """两个左闭右开时段是否重叠（首尾相接不算重叠）。"""
     return lo1 < un2 and lo2 < un1
@@ -140,8 +156,12 @@ def register_manifest(db, payload: ManifestCreate):
     try:
         return _register_manifest_tx(db, payload)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
+        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
+        # OperationalError 也可能在 commit 已落库后抛出（含车次修订号 +1），
+        # 重放前先检测本批窗口是否已存在，已落库则按既有结果返回，避免重复。
         db.rollback()
+        if _manifest_already_applied(db, payload):
+            return _manifest_existing_result(db, payload)
         return _register_manifest_tx(db, payload)
 
 
@@ -154,9 +174,43 @@ def confirm_manifest(db, payload: ManifestConfirmCreate):
     try:
         return _register_manifest_tx(db, payload, expected_digest=payload.digest)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
         db.rollback()
+        if _manifest_already_applied(db, payload):
+            return _manifest_existing_result(db, payload)
         return _register_manifest_tx(db, payload, expected_digest=payload.digest)
+
+
+def _manifest_already_applied(db, payload) -> bool:
+    """commit 后 OperationalError 重放检测：本批窗口是否已全部落库。"""
+    for it in payload.items:
+        loaded_at = ensure_utc(it.loaded_at)
+        exists = db.scalars(
+            select(Loading).where(
+                Loading.trip_id == payload.trip_id,
+                Loading.cargo_id == it.cargo_id,
+                Loading.origin_loaded_at == loaded_at,
+            )
+        ).first()
+        if exists is None:
+            return False
+    return bool(payload.items)
+
+
+def _manifest_existing_result(db, payload) -> ManifestResult:
+    rows = []
+    for it in payload.items:
+        loaded_at = ensure_utc(it.loaded_at)
+        row = db.scalars(
+            select(Loading).where(
+                Loading.trip_id == payload.trip_id,
+                Loading.cargo_id == it.cargo_id,
+                Loading.origin_loaded_at == loaded_at,
+            )
+        ).first()
+        row.loaded_at = ensure_utc(row.loaded_at)
+        row.unloaded_at = ensure_utc(row.unloaded_at)
+        rows.append(row)
+    return ManifestResult(trip_id=payload.trip_id, items=rows)
 
 
 def _register_manifest_tx(
@@ -254,7 +308,7 @@ def _register_manifest_tx(
         ]
         db.add_all(rows)
         # 装卸登记落库 -> 车次修订号 +1（同事务，校验失败回滚则不递增）
-        trip.revision = (trip.revision or 0) + 1
+        _bump_trip_revision(db, trip)
         db.commit()
     except ApiError:
         db.rollback()
@@ -312,6 +366,13 @@ def _manifest_context(db, trip_id: str, norm_items):
     _, reading_eff = timeline.load_effective_maps(
         db, reading_ids={r.reading_id for r in readings}
     )
+    # 本车次生效探头故障：被覆盖读数不参与实际重建，预检中标记供参考
+    from app import faults as faults_mod
+
+    active_faults = faults_mod.load_active_faults(db, {trip_id})
+    reading_quarantine = faults_mod.reading_quarantine_map(
+        readings, active_faults
+    )
     reading_infos = []
     for r in readings:
         eff = reading_eff.get(r.reading_id)
@@ -319,12 +380,15 @@ def _manifest_context(db, trip_id: str, norm_items):
             eff_temp, version = Decimal(eff[0]), eff[1]
         else:
             eff_temp, version = Decimal(r.temperature), 0
+        covers = tuple(reading_quarantine.get(r.reading_id, ()))
         reading_infos.append(
             precheck.ReadingInfo(
                 reading_id=r.reading_id,
                 read_at=ensure_utc(r.read_at),
                 effective_temperature=eff_temp,
                 version=version,
+                quarantined=bool(covers),
+                covering_fault_ids=covers,
             )
         )
     return loadings, cargos, reading_infos
@@ -463,8 +527,16 @@ def create_vehicle_reading(db, payload: VehicleReadingCreate) -> ReadingResult:
     try:
         return _create_reading_tx(db, payload)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
+        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
+        # 注意 OperationalError 也可能在 commit 已成功落库后才抛出（提交时的
+        # 锁等待），重放前先按幂等检测：读数已存在且同内容则直接返回原结果，
+        # 避免把已提交事务（含车次修订号 +1）再执行一遍。
         db.rollback()
+        read_at = ensure_utc(payload.read_at)
+        winner = db.get(VehicleReading, payload.reading_id)
+        if winner is not None and _same_reading_content(winner, payload, read_at):
+            affected = _affected_cargo_ids(db, payload.trip_id, read_at)
+            return ReadingResult(winner, True, affected)
         return _create_reading_tx(db, payload)
 
 
@@ -539,7 +611,7 @@ def _create_reading_tx(db, payload: VehicleReadingCreate) -> ReadingResult:
         )
         db.add(reading)
         # 新读数落库 -> 车次修订号 +1（同事务，冲突回滚则不递增）
-        trip.revision = (trip.revision or 0) + 1
+        _bump_trip_revision(db, trip)
         db.commit()
     except ApiError:
         db.rollback()
@@ -660,12 +732,17 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
             continue
         # 与货物报告同一套重建：必须含该货物**全部车次**的上下文——货物可能
         # 从上一车次带着未闭合越温区间装到本车次，此时自本车次装车时刻起即越温。
-        events, all_loadings, ctx_readings, effective = (
+        events, all_loadings, ctx_readings, effective, quarantine = (
             timeline.load_cargo_context(db, cargo_id)
         )
         event_eff, reading_eff = effective
         points = timeline.adopted_timeline(
-            events, ctx_readings, all_loadings, event_eff, reading_eff
+            events,
+            ctx_readings,
+            all_loadings,
+            event_eff,
+            reading_eff,
+            quarantine,
         )
         result = chain.rebuild_chain(
             cargo.initial_holder, Decimal(cargo.temp_upper_limit), points

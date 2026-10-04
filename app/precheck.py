@@ -140,6 +140,8 @@ class ReadingInfo:
     read_at: object
     effective_temperature: Decimal
     version: int
+    quarantined: bool = False       # 是否被本车次生效探头故障覆盖
+    covering_fault_ids: tuple = ()  # 覆盖该读数的生效故障编号
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,8 @@ class RiskEntry:
     effective_temperature: Decimal
     temp_upper_limit: Decimal
     supplanted_by_own: bool  # 该货物在读数时刻有自有测温（车载读数被取代）
+    quarantined: bool = False  # 该读数被生效探头故障覆盖（实际不参与重建）
+    covering_fault_ids: tuple = ()
 
 
 @dataclass(frozen=True)
@@ -205,6 +209,8 @@ def analyze_segments(
                             supplanted_by_own=(
                                 r.read_at in own_measure_at.get(cargo_id, set())
                             ),
+                            quarantined=r.quarantined,
+                            covering_fault_ids=r.covering_fault_ids,
                         )
                     )
         analyses.append(

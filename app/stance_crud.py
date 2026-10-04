@@ -45,10 +45,12 @@ def _unprocessable(message: str, code: str) -> ApiError:
 
 def _rebuild_closed(db, cargo):
     """持锁/读事务内在合并读数时间线上重建，返回 (chain结果, 闭合区间映射)。"""
-    events, loadings, readings, effective = load_cargo_context(
+    events, loadings, readings, effective, quarantine = load_cargo_context(
         db, cargo.cargo_id
     )
-    return resp.rebuild(cargo, events, loadings, readings, effective)
+    return resp.rebuild(
+        cargo, events, loadings, readings, effective, quarantine
+    )
 
 
 def _resolve_interval(db, cargo, interval_key: str, require_closed: bool = True):
@@ -131,10 +133,17 @@ def submit_stance(db, cargo_id: str, interval_key: str, payload: StanceCreate) -
     kind = _parse_kind(payload)
     # SQLite 文件库无行级锁，极端并发下 busy timeout 耗尽会抛 OperationalError，
     # 整体重试一次即可（行锁/快照校验全部重来，语义不变）；PG 不会触发。
+    # OperationalError 也可能在 commit 已落库后抛出——重放前先按表态编号
+    # 幂等检测，已落库则返回原记录，避免重复写入。
     try:
         return _submit_stance_tx(db, cargo_id, interval_key, payload, kind)
     except OperationalError:
         db.rollback()
+        winner = db.get(Stance, payload.stance_id)
+        if winner is not None and _same_stance_content(
+            winner, cargo_id, interval_key, payload, kind
+        ):
+            return StanceWriteResult(stance=winner, replayed=True)
         return _submit_stance_tx(db, cargo_id, interval_key, payload, kind)
 
 

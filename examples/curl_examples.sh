@@ -720,3 +720,97 @@ vr=[x for x in d["evidence_changes"]["vehicle_readings"] if x["key"]=="svr-1"][0
 print("    svr-1 变更字段 =", vr["fields"], "当前有效值/版本 =", vr["current"]["effective_temperature"], vr["current"]["version"])'
 curl -sS "$BASE/evidence-seals/CASE-SEAL-1" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); v=[r for r in d["content"]["vehicle_readings"] if r["reading_id"]=="svr-1"][0]; print("    原包 svr-1 有效值/版本 =", v["effective_temperature"], v["version"], "（不被更正改写）")'
+
+# ============================================================
+# 车次探头故障登记 / 撤销（独立演示车次，避免影响上面封存链路）
+# ============================================================
+FC="COLD-FAULT-1"; FT="TRUCK-FAULT-1"
+
+echo "65) 探头故障演示：建货物 / 车次 / 装卸 / 09:00 越温读数 / 11:00 闭合读数"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$FC\",
+  \"started_at\": \"2026-10-04T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$FT\", \"vehicle_no\": \"京B-故01\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$FT/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"$FC\",
+    \"loaded_at\": \"2026-10-04T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-04T20:00:00+08:00\"
+  }]
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"fvr-1\", \"trip_id\": \"$FT\",
+  \"read_at\": \"2026-10-04T09:00:00+08:00\", \"temperature\": \"8.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"fvr-2\", \"trip_id\": \"$FT\",
+  \"read_at\": \"2026-10-04T11:00:00+08:00\", \"temperature\": \"2.0\"
+}" >/dev/null
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    越温区间 =", [e["interval_id"] for e in json.load(sys.stdin)["excursions"]])'
+
+echo "66) 登记探头故障（08:30-10:30 左闭右开；09:00 读数被隔离）"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-1\",
+  \"fault_start\": \"2026-10-04T08:30:00+08:00\",
+  \"fault_end\": \"2026-10-04T10:30:00+08:00\",
+  \"reason\": \"探头 PF-9 校准漂移（计量院证实）\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    active =", d["fault"]["active"], "version =", d["fault"]["version"]); print("    隔离读数 =", d["quarantined_reading_ids"], "在车货物 =", d["affected_cargo_ids"])'
+
+echo "67) 同故障编号同请求重传 -> 200 replayed；异内容 -> 409 fault_id_conflict"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-1\",
+  \"fault_start\": \"2026-10-04T08:30:00+08:00\",
+  \"fault_end\": \"2026-10-04T10:30:00+08:00\",
+  \"reason\": \"探头 PF-9 校准漂移（计量院证实）\"
+}" | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin).get("replayed"))'
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-1\",
+  \"fault_start\": \"2026-10-04T08:00:00+08:00\",
+  \"fault_end\": \"2026-10-04T10:30:00+08:00\",
+  \"reason\": \"另一个原因\"
+}"; echo
+echo "    非法时段 422 invalid_fault_window / 缺时区 422 timezone_required："
+curl -sS -o /dev/null -w '    %{http_code} ' -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-bad\",
+  \"fault_start\": \"2026-10-04T10:30:00+08:00\",
+  \"fault_end\": \"2026-10-04T10:30:00+08:00\",
+  \"reason\": \"x\"
+}"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-bad2\",
+  \"fault_start\": \"2026-10-04T13:00:00\",
+  \"fault_end\": \"2026-10-04T14:00:00\",
+  \"reason\": \"x\"
+}" | python3 -c 'import json,sys; print(json.load(sys.stdin)["error"]["code"])'
+
+echo "68) 隔离后：越温报告 / 责任确认重算为空，时间线与车次详情标明隔离与覆盖故障"
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    越温区间 =", json.load(sys.stdin)["excursions"])'
+curl -sS "$BASE/cargo/$FC/timeline" | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["points"]:
+    if p["source"] == "vehicle":
+        print("   ", p["reading_id"], "adopted =", p["adopted"],
+              "quarantined =", p["quarantined"], "covering =", p["covering_fault_ids"])'
+
+echo "69) 撤销故障（期望版本 0）：读数按当前有效温度恢复采用，越温结果重算"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rv-1\", \"fault_id\": \"pf-1\", \"expected_version\": 0
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    active =", d["fault"]["active"], "version =", d["fault"]["version"], "恢复读数 =", d["restored_reading_ids"])'
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    越温区间 =", [e["interval_id"] for e in json.load(sys.stdin)["excursions"]])'
+echo "    撤销重传 replayed / 版本过期 stale_fault_version / 列表留痕："
+curl -sS -X POST "$BASE/trips/$FT/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rv-1\", \"fault_id\": \"pf-1\", \"expected_version\": 0
+}" | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin).get("replayed"))'
+curl -sS -o /dev/null -w '    stale -> %{http_code}\n' -X POST "$BASE/trips/$FT/probe-faults/revoke" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rv-2\", \"fault_id\": \"pf-1\", \"expected_version\": 0
+}"
+curl -sS "$BASE/trips/$FT/probe-faults" \
+  | python3 -c 'import json,sys; print("    故障列表 =", [(f["fault_id"], f["active"], f["version"], (f["revocation"] or {}).get("revocation_id")) for f in json.load(sys.stdin)["faults"]])'

@@ -60,8 +60,13 @@ def create_seal(db, payload: EvidenceSealCreate) -> SealWriteResult:
     try:
         return _create_seal_tx(db, payload)
     except OperationalError:
-        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变
+        # SQLite 文件库锁等待耗尽 / PG 死锁检测中止：整事务重放，语义不变。
+        # OperationalError 也可能在 commit 已落库后抛出——封存成功后重试即使
+        # 现况已变也必须返回原包，故重放前先按案件编号检测已落库的封存包。
         db.rollback()
+        winner = db.get(EvidenceSeal, payload.case_id)
+        if winner is not None:
+            return _replay(winner)
         return _create_seal_tx(db, payload)
 
 
@@ -125,7 +130,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
         from app.timeline import load_cargo_context
         from app import responsibility as resp_mod
 
-        events, loadings, readings, effective = load_cargo_context(
+        events, loadings, readings, effective, quarantine = load_cargo_context(
             db, cargo_id
         )
         rows = stance_crud.load_interval_stances(db, cargo_id, interval_key)
@@ -142,6 +147,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
             loadings,
             effective,
             sealed_at,
+            reading_quarantine=quarantine,
         )
 
         row = EvidenceSeal(

@@ -37,10 +37,13 @@ class TimelinePoint:
 
     自有事件与车载读数在重建阶段统一表示为本结构，链逻辑不感知存储差异。
     ``adopted`` 仅对车载测温有意义：同刻存在货物自有测温时为 False
-    （原始读数仍可查，但不参与重建）；其余点恒为 True。
+    （原始读数仍可查，但不参与重建）；被**生效探头故障**覆盖的车载读数同样
+    为 False（隔离，不参与重建）；其余点恒为 True。
     ``temperature`` 对测温点为**当前有效温度**（应用测温更正后的最新温度，
     无更正时即原始温度）；``temp_version`` 为该有效温度的更正版本
-    （0=原始值，n>=1 表示取第 n 次更正值）。交接点二者无意义。
+    （0=原始值，n>=1 表示取第 n 次更正值）。``quarantine_faults`` 为覆盖该
+    车载读数的生效探头故障编号（空元组=未隔离；自有 / 交接点恒为空）。
+    交接点二者无意义。
     """
 
     occurred_at: object
@@ -53,6 +56,7 @@ class TimelinePoint:
     trip_id: str | None = None
     adopted: bool = True
     temp_version: int = 0
+    quarantine_faults: tuple[str, ...] = ()
 
     @property
     def is_handover(self) -> bool:
