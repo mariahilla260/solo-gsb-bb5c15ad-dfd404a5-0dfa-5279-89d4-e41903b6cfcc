@@ -125,8 +125,8 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
         from app.timeline import load_cargo_context
         from app import responsibility as resp_mod
 
-        events, loadings, readings, effective = load_cargo_context(
-            db, cargo_id
+        events, loadings, readings, effective, active_faults = (
+            load_cargo_context(db, cargo_id)
         )
         rows = stance_crud.load_interval_stances(db, cargo_id, interval_key)
         view = resp_mod.build_interval_view(cargo_id, ex, rows)
@@ -142,6 +142,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
             loadings,
             effective,
             sealed_at,
+            active_faults=active_faults,
         )
 
         row = EvidenceSeal(

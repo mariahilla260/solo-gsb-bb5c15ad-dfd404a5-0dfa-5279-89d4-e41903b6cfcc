@@ -387,6 +387,111 @@ def test_concurrent_loading_correction_and_event_write_serialize(client):
     assert len(hist["corrections"]) == 1
 
 
+def test_concurrent_probe_fault_and_reading_write_serialize(client):
+    """探头故障登记 / 撤销与车载读数写入、货物事件写入共用货物行锁 + 车次行锁。
+
+    8 个线程并发提交**同一故障编号同请求**登记：行锁串行后表现为 1 次写入 +
+    其余幂等 200；故障只登记一次、车次修订号只 +1。另并发撤销与该货物事件
+    写入，不得出现损坏 / 5xx，最终隔离状态确定。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CPF",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post(
+        "/trips", json={"trip_id": "TPF", "vehicle_no": "V"}
+    ).status_code == 201
+    assert client.post(
+        "/trips/TPF/manifest",
+        json={"items": [{
+            "cargo_id": "CPF",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-01T18:00:00+00:00",
+        }]},
+    ).status_code == 201
+    revision0 = client.get("/trips/TPF").json()["revision"]
+
+    def submit_fault(i):
+        return client.post(
+            "/trips/TPF/probe-faults",
+            json={
+                "fault_id": "pf-same",
+                "fault_start_at": "2026-01-01T11:00:00+00:00",
+                "fault_end_at": "2026-01-01T12:00:00+00:00",
+                "reason": "并发同一故障",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit_fault, range(8)))
+
+    assert codes.count(201) == 1
+    assert codes.count(200) == 7
+    detail = client.get("/trips/TPF").json()
+    assert len(detail["probe_faults"]) == 1
+    assert detail["revision"] == revision0 + 1
+
+    # 并发：撤销（同一撤销编号）+ 故障窗内的晚到车载读数 + 货物自有测温。
+    # 无论先后，结果确定：撤销成功一次；vr@11:30 若在撤销前提交则被故障覆盖，
+    # 撤销后恢复（读数 9℃ 越限 -> 开启区间），自有事件始终参与重建。
+    def submit_revoke(i):
+        return client.post(
+            "/probe-fault-revocations",
+            json={
+                "revocation_id": "rev-same",
+                "fault_id": "pf-same",
+                "expected_version": 0,
+            },
+        ).status_code
+
+    def submit_reading(i):
+        return client.post(
+            "/vehicle-readings",
+            json={
+                "reading_id": "vr-late",
+                "trip_id": "TPF",
+                "read_at": "2026-01-01T11:30:00+00:00",
+                "temperature": "9",
+            },
+        ).status_code
+
+    def submit_event(i):
+        return client.post(
+            "/events",
+            json={
+                "event_id": f"m-{i}",
+                "cargo_id": "CPF",
+                "occurred_at": f"2026-01-01T13:{i:02d}:00+00:00",
+                "temperature": "4",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        rev_codes = list(pool.map(submit_revoke, range(4)))
+        read_codes = list(pool.map(submit_reading, range(2)))
+        event_codes = list(pool.map(submit_event, range(2)))
+
+    assert rev_codes.count(201) == 1
+    assert rev_codes.count(200) == 3
+    assert set(read_codes) <= {200, 201}
+    assert set(event_codes) <= {200, 201}
+    fault = client.get("/probe-faults/pf-same").json()
+    assert fault["status"] == "revoked" and fault["version"] == 1
+    detail = client.get("/trips/TPF").json()
+    # 修订号：登记 +1、撤销 +1，并发晚到读数落库也按既有规则 +1（幂等重传不增）
+    assert detail["revision"] == revision0 + 2 + (1 if 201 in read_codes else 0)
+    # 晚到读数已恢复采用（故障已撤销），9℃ 开启越温
+    tl = client.get("/cargo/CPF/timeline").json()["points"]
+    vr = next(p for p in tl if p["reading_id"] == "vr-late")
+    assert vr["adopted"] is True and vr["isolated"] is False
+    assert client.get("/cargo/CPF/report").json()["excursions"][0]["interval_id"] == "veh:vr-late"
+
+
 def test_concurrent_seal_and_event_write_serialize(client):
     """封存与同货物的事件写入共用货物行锁：
 

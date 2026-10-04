@@ -53,6 +53,11 @@ class TimelinePoint:
     trip_id: str | None = None
     adopted: bool = True
     temp_version: int = 0
+    # 仅车载测温有意义：是否被生效探头故障时段隔离（isolated=True 时 adopted
+    # 必为 False；被同刻自有测温取代不算隔离）
+    isolated: bool = False
+    # 覆盖该车载读数的生效故障编号（按编号排序；隔离依据，自有点恒为空元组）
+    covering_fault_ids: tuple = ()
 
     @property
     def is_handover(self) -> bool:

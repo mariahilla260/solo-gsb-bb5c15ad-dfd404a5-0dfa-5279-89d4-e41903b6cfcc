@@ -261,3 +261,51 @@ CREATE TABLE IF NOT EXISTS evidence_seal (
 
 CREATE INDEX IF NOT EXISTS ix_evidence_seal_cargo_interval
     ON evidence_seal (cargo_id, interval_key);
+
+-- 车次探头故障时段（左闭右开；append-only 留痕，可撤销）。
+-- 任一生效（status='active'）故障覆盖的车载读数不参与货物越温重建（晚到
+-- 读数亦同）；原始读数与温度更正历史照常可查。撤销不删除行：status 置为
+-- revoked、version=1 并记录撤销编号/时刻，撤销明细见 probe_fault_revocation。
+-- 成功登记 / 撤销同事务使车次修订号 +1（旧装卸预检摘要失效）。
+CREATE TABLE IF NOT EXISTS probe_fault (
+    fault_id         VARCHAR(64)   PRIMARY KEY,
+    trip_id          VARCHAR(64)   NOT NULL
+                       REFERENCES trip(trip_id) ON DELETE RESTRICT,
+    fault_start_at   TIMESTAMPTZ   NOT NULL,
+    fault_end_at     TIMESTAMPTZ   NOT NULL,
+    reason           VARCHAR(512)  NOT NULL,
+    status           VARCHAR(16)   NOT NULL DEFAULT 'active',
+    version          INTEGER       NOT NULL DEFAULT 0,
+    revocation_id    VARCHAR(64),
+    revoked_at       TIMESTAMPTZ,
+    request_hash     VARCHAR(71)   NOT NULL,
+    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_probe_fault_shape CHECK (
+        fault_start_at < fault_end_at
+        AND char_length(reason) > 0
+        AND (
+            (status = 'active' AND revoked_at IS NULL
+                AND revocation_id IS NULL AND version = 0)
+            OR
+            (status = 'revoked' AND revoked_at IS NOT NULL
+                AND revocation_id IS NOT NULL AND version = 1)
+        )
+    )
+);
+
+CREATE INDEX IF NOT EXISTS ix_probe_fault_trip_time
+    ON probe_fault (trip_id, fault_start_at, fault_end_at);
+
+-- 探头故障撤销留痕（append-only：每个故障至多一条撤销明细）。
+CREATE TABLE IF NOT EXISTS probe_fault_revocation (
+    revocation_id    VARCHAR(64)   PRIMARY KEY,
+    fault_id         VARCHAR(64)   NOT NULL
+                       REFERENCES probe_fault(fault_id) ON DELETE RESTRICT,
+    trip_id          VARCHAR(64)   NOT NULL,
+    expected_version INTEGER       NOT NULL,
+    version          INTEGER       NOT NULL,
+    request_hash     VARCHAR(71)   NOT NULL,
+    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now()
+);
+

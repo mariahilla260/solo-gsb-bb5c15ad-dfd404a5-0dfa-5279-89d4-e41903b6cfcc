@@ -470,6 +470,105 @@ class LoadingCorrection(Base):
     )
 
 
+class ProbeFault(Base):
+    """车次探头故障时段登记（左闭右开，append-only 留痕，可撤销）。
+
+    质控人员确认车次探头失准后，凭**故障编号** ``fault_id``（主键，客户端
+    指定）、车次、带时区起止时刻与原因登记故障时段
+    ``[fault_start_at, fault_end_at)``。故障时段允许重叠；任一生效故障
+    覆盖的车载读数（读数时刻落在该时段内且对该货物在车适用）即被**隔离**：
+    原始读数与温度更正历史照常可查，但不参与任何货物的越温重建（晚到读数
+    亦同）；同刻自有测温优先与交接不受影响。
+
+    ``status`` 为该行当前状态（``active`` / ``revoked``），``version`` 为
+    故障版本（0=生效，撤销成功后变为 1）——撤销请求的 ``expected_version``
+    乐观锁即取此版本。撤销不删除行、不修改登记留痕字段，只把状态改为
+    revoked 并记录撤销编号与撤销时刻；撤销明细另存于
+    :class:`ProbeFaultRevocation`。撤销最后一条覆盖某读数的故障后，该读数
+    按当前有效温度恢复采用。
+
+    ``request_hash`` 为登记请求（车次/起止/原因）的指纹，供同故障编号
+    幂等 / 冲突裁决。成功登记 / 撤销在持车次行锁的同一事务内把车次修订号
+    +1，使旧装卸预检摘要失效。
+    """
+
+    __tablename__ = "probe_fault"
+    __table_args__ = (
+        CheckConstraint(
+            "fault_start_at < fault_end_at "
+            "AND reason IS NOT NULL AND char_length(reason) > 0 "
+            "AND ((status = 'active' AND revoked_at IS NULL "
+            "     AND revocation_id IS NULL AND version = 0) "
+            " OR (status = 'revoked' AND revoked_at IS NOT NULL "
+            "     AND revocation_id IS NOT NULL AND version = 1))",
+            name="chk_probe_fault_shape",
+        ),
+        Index("ix_probe_fault_trip_time", "trip_id", "fault_start_at", "fault_end_at"),
+    )
+
+    fault_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    trip_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("trip.trip_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    fault_start_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    fault_end_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    # active=生效（覆盖读数参与隔离）；revoked=已撤销（不再影响重建，留痕保留）
+    status: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="active", server_default="active"
+    )
+    # 故障版本：0=生效，撤销成功后为 1（撤销乐观锁）
+    version: Mapped[int] = mapped_column(
+        nullable=False, default=0, server_default="0"
+    )
+    revocation_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # 登记请求指纹（幂等 / 冲突裁决）
+    request_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
+class ProbeFaultRevocation(Base):
+    """车次探头故障撤销留痕（append-only，每个故障至多一条）。
+
+    质控人员凭**撤销编号** ``revocation_id``（主键，客户端指定）、故障编号
+    与**期望版本** ``expected_version`` 撤销一条故障。撤销只追加明细行并
+    把对应 :class:`ProbeFault` 行置为 revoked（version=1），不删除任何登记
+    留痕。``request_hash`` 为撤销请求（故障编号 + 期望版本）的指纹，供同
+    撤销编号幂等 / 冲突裁决。
+    """
+
+    __tablename__ = "probe_fault_revocation"
+
+    revocation_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    fault_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("probe_fault.fault_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    trip_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(71), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class EvidenceSeal(Base):
     """责任证据封存包（append-only，封存内容此后不可改）。
 

@@ -231,12 +231,14 @@ def rebuild(
     loadings=None,
     vehicle_readings=None,
     effective=None,
+    active_faults=None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
     """在合并读数时间线上重建保管链，返回（重建结果, 区间标识 -> 闭合区间）。
 
     ``own_events`` 为货物自有事件；``loadings`` / ``vehicle_readings``
     为该货物的装卸时段与相关车载读数（缺省时退化为仅自有事件，兼容旧调用）。
-    ``effective`` 为 ``(event_effective, reading_effective)`` 更正有效值映射。
+    ``effective`` 为 ``(event_effective, reading_effective)`` 更正有效值映射；
+    ``active_faults`` 为相关车次的生效探头故障时段（被覆盖车载读数不参与重建）。
     """
     from app import chain, timeline
 
@@ -250,6 +252,7 @@ def rebuild(
             loadings,
             event_effective,
             reading_effective,
+            active_faults,
         )
     result = chain.rebuild_chain(
         cargo.initial_holder, Decimal(cargo.temp_upper_limit), items

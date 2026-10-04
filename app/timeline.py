@@ -6,15 +6,23 @@
   ``[loaded_at, unloaded_at)`` 且 ``loaded_at <= 读数时刻 < unloaded_at``（左闭右开）。
 * 同一时刻该货物有自有测温时，**优先采用自有测温**；车载读数在该时刻对该货物
   标记 ``adopted=False``（被取代），不参与越温重建，但原始读数仍可查询。
+* **车次探头故障隔离**：读数时刻落在该车次任一生效（未撤销）故障时段
+  ``[fault_start_at, fault_end_at)`` 内的车载读数同样标记 ``adopted=False``
+  （``isolated=True``，并给出覆盖故障编号），不参与越温重建；原始读数、温度
+  更正历史与隔离状态照常可查。晚到读数也按当前生效故障判定；撤销最后一条
+  覆盖故障后读数按当前有效温度恢复采用。
 * 交接事件只来自货物自有事件，车载读数从不改变保管方。
 * **测温更正生效于有效温度**：测温点的温度取该自有测温 / 车载读数最新一次
   更正后的有效温度（无更正时为原始温度）。同刻自有测温优先仍只取决于“该时刻
-  是否存在自有测温”，与温度取值无关；被取代的车载点同样携带更正后的有效温度
-  与版本（仅用于展示，不参与重建）。
+  是否存在自有测温”，与温度取值无关；被取代 / 被隔离的车载点同样携带更正后的
+  有效温度与版本（仅用于展示，不参与重建）。
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from decimal import Decimal
+
+from sqlalchemy import select
 
 from app.chain import (
     SOURCE_OWN,
@@ -22,6 +30,7 @@ from app.chain import (
     TimelinePoint,
     point_from_event,
 )
+from app.timeutil import ensure_utc
 
 
 def is_on_board(loading, at) -> bool:
@@ -45,14 +54,34 @@ def onboard_loadings(loadings, at) -> list:
     return [l for l in loadings if is_on_board(l, at)]
 
 
+@dataclass(frozen=True)
+class ActiveFault:
+    """一条生效（未撤销）的车次探头故障时段（左闭右开）。"""
+
+    fault_id: str
+    trip_id: str
+    start: object
+    end: object
+
+
+def covering_faults(active_faults, trip_id: str, at) -> list:
+    """读数时刻在该车次生效故障时段内的故障（左闭右开 [start, end)）。"""
+    return [
+        f
+        for f in active_faults
+        if f.trip_id == trip_id and f.start <= at < f.end
+    ]
+
+
 def merged_timeline(
     own_events,
     vehicle_readings,
     loadings,
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
+    active_faults: list | None = None,
 ) -> list[TimelinePoint]:
-    """生成货物的完整读数时间线（含被取代的车载点，按时间升序）。
+    """生成货物的完整读数时间线（含被取代/被隔离的车载点，按时间升序）。
 
     :param own_events: 该货物的全部自有事件（测温 / 交接）。
     :param vehicle_readings: 该货物所有车次的车载原始读数（可含与其无关车次的，
@@ -61,9 +90,13 @@ def merged_timeline(
     :param event_effective: 自有测温事件ID -> ``(有效温度, 版本)``，
         仅含发生过更正的测温；缺失即原始温度、版本 0。
     :param reading_effective: 车载读数ID -> ``(有效温度, 版本)``，语义同上。
+    :param active_faults: 生效（未撤销）的车次探头故障时段列表
+        （:class:`ActiveFault``）；读数时刻被任一同车次故障覆盖即隔离
+        （``adopted=False``、``isolated=True``，原始点仍列出）。
     """
     event_effective = event_effective or {}
     reading_effective = reading_effective or {}
+    active_faults = active_faults or []
 
     points: list[TimelinePoint] = []
     own_measure_at = set()
@@ -95,6 +128,9 @@ def merged_timeline(
             temperature, r_version = Decimal(eff[0]), eff[1]
         else:
             temperature, r_version = Decimal(r.temperature), 0
+        faults = covering_faults(active_faults, r.trip_id, r.read_at)
+        fault_ids = tuple(sorted(f.fault_id for f in faults))
+        supplanted = r.read_at in own_measure_at
         points.append(
             TimelinePoint(
                 occurred_at=r.read_at,
@@ -103,8 +139,11 @@ def merged_timeline(
                 source=SOURCE_VEHICLE,
                 source_id=r.reading_id,
                 trip_id=r.trip_id,
-                adopted=r.read_at not in own_measure_at,
+                # 同刻自有测温被取代，或被生效探头故障覆盖，均不参与重建
+                adopted=not supplanted and not fault_ids,
                 temp_version=r_version,
+                isolated=bool(fault_ids),
+                covering_fault_ids=fault_ids,
             )
         )
     points.sort(
@@ -124,6 +163,7 @@ def adopted_timeline(
     loadings,
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
+    active_faults: list | None = None,
 ) -> list[TimelinePoint]:
     """只含被采用点的时间线，供保管链重建使用。"""
     return [
@@ -134,22 +174,30 @@ def adopted_timeline(
             loadings,
             event_effective,
             reading_effective,
+            active_faults,
         )
         if p.adopted
     ]
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数与测温更正有效值。
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值
+    与相关车次的**生效探头故障时段**。
 
-    返回 ``(events, loadings, readings, effective)``；``effective`` 为
-    ``(event_effective, reading_effective)`` 两个映射，键分别为自有测温事件ID
-    与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过更正的目标。
+    返回 ``(events, loadings, readings, effective, active_faults)``；
+    ``effective`` 为 ``(event_effective, reading_effective)`` 两个映射，键分别为
+    自有测温事件ID 与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过更正
+    的目标；``active_faults`` 为该货物所有相关车次上未撤销故障的
+    :class:`ActiveFault` 列表（车载读数隔离依据）。
     """
-    from sqlalchemy import select
-
-    from app.models import Event, Loading, TemperatureCorrection, Trip, VehicleReading
-    from app.timeutil import ensure_utc
+    from app.models import (
+        Event,
+        Loading,
+        ProbeFault,
+        TemperatureCorrection,
+        Trip,
+        VehicleReading,
+    )
 
     events = list(
         db.scalars(
@@ -173,6 +221,7 @@ def load_cargo_context(db, cargo_id: str):
         l.unloaded_at = ensure_utc(l.unloaded_at)
 
     readings: list = []
+    active_faults: list = []
     if loadings:
         trip_ids = {l.trip_id for l in loadings}
         rows = list(
@@ -187,6 +236,24 @@ def load_cargo_context(db, cargo_id: str):
         # 仅按关系惰性引用，trip 行由车次查询单独获取
         readings = rows
 
+        fault_rows = list(
+            db.scalars(
+                select(ProbeFault).where(
+                    ProbeFault.trip_id.in_(trip_ids),
+                    ProbeFault.status == "active",
+                )
+            ).all()
+        )
+        active_faults = [
+            ActiveFault(
+                fault_id=f.fault_id,
+                trip_id=f.trip_id,
+                start=ensure_utc(f.fault_start_at),
+                end=ensure_utc(f.fault_end_at),
+            )
+            for f in fault_rows
+        ]
+
     effective = load_effective_maps(
         db,
         event_ids={
@@ -195,7 +262,7 @@ def load_cargo_context(db, cargo_id: str):
         },
         reading_ids={r.reading_id for r in readings},
     )
-    return events, loadings, readings, effective
+    return events, loadings, readings, effective, active_faults
 
 
 def load_effective_maps(db, event_ids=None, reading_ids=None):

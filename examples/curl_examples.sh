@@ -720,3 +720,120 @@ vr=[x for x in d["evidence_changes"]["vehicle_readings"] if x["key"]=="svr-1"][0
 print("    svr-1 变更字段 =", vr["fields"], "当前有效值/版本 =", vr["current"]["effective_temperature"], vr["current"]["version"])'
 curl -sS "$BASE/evidence-seals/CASE-SEAL-1" \
   | python3 -c 'import json,sys; d=json.load(sys.stdin); v=[r for r in d["content"]["vehicle_readings"] if r["reading_id"]=="svr-1"][0]; print("    原包 svr-1 有效值/版本 =", v["effective_temperature"], v["version"], "（不被更正改写）")'
+
+# ============================================================
+# 本轮新增：车次探头故障登记 / 撤销（左闭右开，登记与撤销均留痕）
+# ============================================================
+FC="FAULT-CARGO-1"
+FT="FAULT-TRIP-1"
+
+echo "65) 准备隔离场景：货物 4℃ 上限 + 车次/装卸 + 09:00 车载 7℃ 开启、12:00 车载 3℃ 闭合"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$FC\",
+  \"started_at\": \"2026-10-04T08:00:00+08:00\",
+  \"temp_upper_limit\": \"4.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"$FT\", \"vehicle_no\": \"京B-探01\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/$FT/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"$FC\",
+    \"loaded_at\": \"2026-10-04T08:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-04T20:00:00+08:00\"
+  }]
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"fvr-1\", \"trip_id\": \"$FT\",
+  \"read_at\": \"2026-10-04T09:00:00+08:00\", \"temperature\": \"7.0\"
+}" >/dev/null
+curl -sS -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "{
+  \"reading_id\": \"fvr-2\", \"trip_id\": \"$FT\",
+  \"read_at\": \"2026-10-04T12:00:00+08:00\", \"temperature\": \"3.0\"
+}" >/dev/null
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    隔离前区间 =", [e["interval_id"] for e in json.load(sys.stdin)["excursions"]])'
+
+echo "66) 登记探头故障时段 [09:00, 12:00)（带时区起止、原因；回执给受影响货物）"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-20261004-1\",
+  \"fault_start_at\": \"2026-10-04T09:00:00+08:00\",
+  \"fault_end_at\": \"2026-10-04T12:00:00+08:00\",
+  \"reason\": \"探头比对检定失准，示值系统性偏高\"
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["fault"]; print("    故障 =", f["fault_id"], f["status"], "version =", f["version"], "受影响货物 =", d["affected_cargo_ids"])'
+
+echo "67) 同故障编号同请求重传 -> 200 replayed；异内容 -> 409 probe_fault_id_conflict"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-20261004-1\",
+  \"fault_start_at\": \"2026-10-04T09:00:00+08:00\",
+  \"fault_end_at\": \"2026-10-04T12:00:00+08:00\",
+  \"reason\": \"探头比对检定失准，示值系统性偏高\"
+}" | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin).get("replayed"))'
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-20261004-1\",
+  \"fault_start_at\": \"2026-10-04T09:00:00+08:00\",
+  \"fault_end_at\": \"2026-10-04T13:00:00+08:00\",
+  \"reason\": \"异内容重传\"
+}"; echo
+
+echo "68) 隔离生效：越温区间消失；时间线仍可查原始读数，标明隔离状态与覆盖故障"
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    隔离后区间 =", [e["interval_id"] for e in json.load(sys.stdin)["excursions"]])'
+curl -sS "$BASE/cargo/$FC/timeline" | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["points"]:
+    if p["reading_id"]:
+        print("   ", p["reading_id"], "adopted =", p["adopted"], "isolated =", p["isolated"], "覆盖故障 =", p["covering_fault_ids"])'
+curl -sS "$BASE/vehicle-readings/fvr-1/corrections" \
+  | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    原始温度 / 有效温度 / 版本 =", d["original_temperature"], d["effective_temperature"], d["version"])'
+
+echo "69) 车次详情：每笔读数对各货物给出 isolated / covering_fault_ids / reason，并列全部故障"
+curl -sS "$BASE/trips/$FT" | python3 -c '
+import json,sys
+d=json.load(sys.stdin)
+for r in d["readings"]:
+    for a in r["applications"]:
+        print("   ", r["reading_id"], a["cargo_id"], "adopted =", a["adopted"], "isolated =", a["isolated"], a["covering_fault_ids"], a["reason"])
+print("    故障 =", [(f["fault_id"], f["status"], f["version"]) for f in d["probe_faults"]])'
+
+echo "70) 故障列表与单条查询（登记与撤销均留痕，含已撤销）"
+curl -sS "$BASE/trips/$FT/probe-faults" \
+  | python3 -c 'import json,sys; print("   ", [(f["fault_id"], f["status"]) for f in json.load(sys.stdin)])'
+curl -sS "$BASE/probe-faults/pf-20261004-1" \
+  | python3 -c 'import json,sys; f=json.load(sys.stdin); print("    单条 =", f["fault_id"], f["fault_start_at"], f["fault_end_at"], f["reason"])'
+
+echo "71) 撤销故障（撤销编号 + 故障编号 + 期望版本 0）：读数按当前有效温度恢复采用"
+curl -sS -X POST "$BASE/probe-fault-revocations" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rev-20261004-1\",
+  \"fault_id\": \"pf-20261004-1\",
+  \"expected_version\": 0
+}" | python3 -c 'import json,sys; d=json.load(sys.stdin); f=d["fault"]; print("    故障 =", f["fault_id"], f["status"], "version =", f["version"], "撤销编号 =", f["revocation_id"])'
+
+echo "72) 撤销后区间恢复；重复撤销 -> 409 stale_fault_version；撤销编号异请求冲突"
+curl -sS "$BASE/cargo/$FC/report" \
+  | python3 -c 'import json,sys; print("    恢复后区间 =", [e["interval_id"] for e in json.load(sys.stdin)["excursions"]])'
+curl -sS -X POST "$BASE/probe-fault-revocations" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rev-20261004-2\",
+  \"fault_id\": \"pf-20261004-1\",
+  \"expected_version\": 0
+}"; echo
+curl -sS -X POST "$BASE/probe-fault-revocations" -H 'Content-Type: application/json' -d "{
+  \"revocation_id\": \"rev-20261004-1\",
+  \"fault_id\": \"pf-20261004-1\",
+  \"expected_version\": 1
+}"; echo
+
+echo "73) 非法时段 / 缺时区 / 未知车次均拒绝且不留部分写入"
+curl -sS -X POST "$BASE/trips/$FT/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-bad\",
+  \"fault_start_at\": \"2026-10-04T12:00:00+08:00\",
+  \"fault_end_at\": \"2026-10-04T12:00:00+08:00\",
+  \"reason\": \"零长度时段\"
+}"; echo
+curl -sS -X POST "$BASE/trips/NO-SUCH-TRIP/probe-faults" -H 'Content-Type: application/json' -d "{
+  \"fault_id\": \"pf-bad2\",
+  \"fault_start_at\": \"2026-10-04T09:00:00+08:00\",
+  \"fault_end_at\": \"2026-10-04T10:00:00+08:00\",
+  \"reason\": \"未知车次\"
+}"; echo

@@ -702,5 +702,76 @@ def main() -> None:
         show("未知案件（404 seal_not_found）", api.get("/evidence-seals/NO-SUCH-CASE"))
 
 
+        # ------------------------------------------------------------
+        # 车次探头故障登记 / 撤销（左闭右开，登记与撤销均留痕）
+        # ------------------------------------------------------------
+        fc, ft = "FAULT-CARGO-PY", "FAULT-TRIP-PY"
+        api.post("/cargo", json={
+            "cargo_id": fc, "started_at": "2026-10-04T08:00:00+08:00",
+            "temp_upper_limit": "4.0", "initial_holder": "北京冷库"})
+        api.post("/trips", json={"trip_id": ft, "vehicle_no": "京B-探py"})
+        api.post(f"/trips/{ft}/manifest", json={"items": [{
+            "cargo_id": fc,
+            "loaded_at": "2026-10-04T08:00:00+08:00",
+            "unloaded_at": "2026-10-04T20:00:00+08:00"}]})
+        api.post("/vehicle-readings", json={
+            "reading_id": "fvr-py-1", "trip_id": ft,
+            "read_at": "2026-10-04T09:00:00+08:00", "temperature": "7.0"})
+        api.post("/vehicle-readings", json={
+            "reading_id": "fvr-py-2", "trip_id": ft,
+            "read_at": "2026-10-04T12:00:00+08:00", "temperature": "3.0"})
+        print("隔离前区间 =",
+              [e["interval_id"] for e in api.get(f"/cargo/{fc}/report").json()["excursions"]])
+
+        fault_body = {
+            "fault_id": "pf-py-1",
+            "fault_start_at": "2026-10-04T09:00:00+08:00",
+            "fault_end_at": "2026-10-04T12:00:00+08:00",
+            "reason": "探头比对检定失准，示值系统性偏高",
+        }
+        show("登记探头故障 [09:00,12:00)（201；受影响货物）",
+             api.post(f"/trips/{ft}/probe-faults", json=fault_body))
+        show("同请求重传（200 replayed）",
+             api.post(f"/trips/{ft}/probe-faults", json=fault_body))
+        print("隔离后区间 =",
+              [e["interval_id"] for e in api.get(f"/cargo/{fc}/report").json()["excursions"]])
+        for pt in api.get(f"/cargo/{fc}/timeline").json()["points"]:
+            if pt["reading_id"]:
+                print("   ", pt["reading_id"], "adopted =", pt["adopted"],
+                      "isolated =", pt["isolated"],
+                      "覆盖故障 =", pt["covering_fault_ids"])
+        show("车次故障列表（留痕，含已撤销）", api.get(f"/trips/{ft}/probe-faults"))
+        show("单条故障查询", api.get("/probe-faults/pf-py-1"))
+        show("异内容同编号（409 probe_fault_id_conflict）",
+             api.post(f"/trips/{ft}/probe-faults",
+                      json={**fault_body, "fault_end_at": "2026-10-04T13:00:00+08:00"}))
+        show("非法时段（422 invalid_fault_window）",
+             api.post(f"/trips/{ft}/probe-faults", json={
+                 "fault_id": "pf-py-bad",
+                 "fault_start_at": "2026-10-04T12:00:00+08:00",
+                 "fault_end_at": "2026-10-04T12:00:00+08:00",
+                 "reason": "零长度"}))
+
+        revoke_body = {
+            "revocation_id": "rev-py-1", "fault_id": "pf-py-1",
+            "expected_version": 0,
+        }
+        show("撤销故障（201；读数按当前有效温度恢复采用）",
+             api.post("/probe-fault-revocations", json=revoke_body))
+        show("撤销请求重传（200 replayed）",
+             api.post("/probe-fault-revocations", json=revoke_body))
+        print("恢复后区间 =",
+              [e["interval_id"] for e in api.get(f"/cargo/{fc}/report").json()["excursions"]])
+        show("已撤销再撤销（409 stale_fault_version）",
+             api.post("/probe-fault-revocations",
+                      json={"revocation_id": "rev-py-2", "fault_id": "pf-py-1",
+                            "expected_version": 0}))
+        show("未知故障（404 probe_fault_not_found）",
+             api.post("/probe-fault-revocations",
+                      json={"revocation_id": "rev-py-x", "fault_id": "no-such",
+                            "expected_version": 0}))
+
+
+
 if __name__ == "__main__":
     main()

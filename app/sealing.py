@@ -130,7 +130,8 @@ def _own_event_item(e, event_effective: dict) -> dict:
     }
 
 
-def _reading_item(r, reading_effective: dict, adopted: bool) -> dict:
+def _reading_item(r, reading_effective: dict, adopted: bool,
+                  isolated: bool = False, covering_fault_ids=None) -> dict:
     eff = reading_effective.get(r.reading_id)
     return {
         "reading_id": r.reading_id,
@@ -142,6 +143,8 @@ def _reading_item(r, reading_effective: dict, adopted: bool) -> dict:
         ),
         "version": eff[1] if eff is not None else 0,
         "adopted": adopted,
+        "isolated": isolated,
+        "covering_fault_ids": sorted(covering_fault_ids or []),
     }
 
 
@@ -164,6 +167,7 @@ def scoped_evidence(
     start_bound,
     span_end,
     apply_window_filter: bool = True,
+    active_faults=None,
 ):
     """按时间范围归集重建证据（封存与现况对照共用同一定义）。
 
@@ -174,10 +178,14 @@ def scoped_evidence(
     :param apply_window_filter: 自有事件是否同样施加下界——封存与对照的
         自有事件均取“不晚于闭合时刻”的**全部**事件（含开启前完整保管链，
         下界置 False）；车载读数 / 装卸窗口恒按下界与上界归集。
+    :param active_faults: 相关车次的生效探头故障时段（:class:`timeline.ActiveFault`
+        列表）；被覆盖的适用车载读数标记 ``isolated=true`` 与覆盖故障编号，
+        与时间线的隔离判定一致。
     :returns: ``(own_event_items, reading_items, loading_items)`` 规范化字典，
         分别按 事件ID / (读数时刻, 读数ID) / (车次, 原装车时刻) 升序。
     """
     event_effective, reading_effective = effective
+    active_faults = active_faults or []
 
     lower = ensure_utc(start_bound) if start_bound is not None else None
 
@@ -200,8 +208,8 @@ def scoped_evidence(
     }
 
     # 车载读数：对该货物适用（同车次 + 当前窗口左闭右开在车）且读数时刻
-    # 落在范围内；被同刻自有测温取代的原始读数同样封存（adopted=false），
-    # 以完整保留“同刻自有优先”的重建上下文。
+    # 落在范围内；被同刻自有测温取代或被生效探头故障隔离的原始读数同样
+    # 封存（adopted=false），以完整保留重建上下文（同刻自有优先 + 故障隔离）。
     reading_items = []
     for r in readings:
         read_at = ensure_utc(r.read_at)
@@ -212,8 +220,17 @@ def scoped_evidence(
         applicable = any(timeline.is_reading_applicable(l, r) for l in loadings)
         if not applicable:
             continue
+        faults = timeline.covering_faults(active_faults, r.trip_id, read_at)
+        fault_ids = sorted(f.fault_id for f in faults)
+        supplanted = read_at in own_measure_at
         reading_items.append(
-            _reading_item(r, reading_effective, read_at not in own_measure_at)
+            _reading_item(
+                r,
+                reading_effective,
+                adopted=not supplanted and not fault_ids,
+                isolated=bool(fault_ids),
+                covering_fault_ids=fault_ids,
+            )
         )
     reading_items.sort(key=lambda x: (x["read_at"], x["reading_id"]))
 
@@ -287,6 +304,7 @@ def build_seal_payload(
     loadings,
     effective,
     sealed_at,
+    active_faults=None,
 ) -> SealPayload:
     """在一个一致的已提交视图上组装封存包并计算内容摘要。
 
@@ -294,6 +312,7 @@ def build_seal_payload(
     :param interval_view: :meth:`responsibility.build_interval_view` 的视图
         （提供当时各责任方最新有效表态）。
     :param sealed_at: 封存时刻（datetime，统一转 UTC 秒级）。
+    :param active_faults: 相关车次的生效探头故障时段（车载读数隔离依据）。
     """
     start, end = ensure_utc(ex.start), ensure_utc(ex.end)
     # 封存自有事件取“不晚于闭合时刻”的全部事件（含开启前完整保管链，
@@ -306,6 +325,7 @@ def build_seal_payload(
         start,
         end,
         apply_window_filter=False,
+        active_faults=active_faults,
     )
 
     sealed_at_s = ts(sealed_at)
@@ -356,16 +376,17 @@ class CurrentState:
     readings: list
     loadings: list
     effective: tuple
+    active_faults: list = None
 
 
 def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
     """按当前数据重建目标区间状态（读事务内调用；不抛 404/422）。"""
-    events, loadings, readings, effective = timeline.load_cargo_context(
-        db, cargo.cargo_id
+    events, loadings, readings, effective, active_faults = (
+        timeline.load_cargo_context(db, cargo.cargo_id)
     )
     cargo_start = ensure_utc(cargo.started_at)
     chain_result, closed = resp.rebuild(
-        cargo, events, loadings, readings, effective
+        cargo, events, loadings, readings, effective, active_faults
     )
     ex = closed.get(interval_key)
     open_ex = next(
@@ -391,6 +412,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
             readings=readings,
             loadings=loadings,
             effective=effective,
+            active_faults=active_faults,
         )
     if open_ex is not None:
         return CurrentState(
@@ -404,6 +426,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
             readings=readings,
             loadings=loadings,
             effective=effective,
+            active_faults=active_faults,
         )
     return CurrentState(
         status=STATUS_DISAPPEARED,
@@ -416,6 +439,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
         readings=readings,
         loadings=loadings,
         effective=effective,
+        active_faults=active_faults,
     )
 
 
@@ -487,7 +511,24 @@ def _current_evidence(state: CurrentState, start_bound, span_end):
         start_bound,
         span_end,
         apply_window_filter=False,
+        active_faults=state.active_faults,
     )
+
+
+def _normalize_reading_items(items: list[dict]) -> list[dict]:
+    """旧封存包（探头故障功能上线前）的车载读数项补齐隔离字段默认值。
+
+    旧包没有 ``isolated`` / ``covering_fault_ids`` 键；对照现况时统一补为
+    false / []，避免旧包在现况无变化时被误判为 changed（原包内容与摘要
+    不被改写，仅在比较时归一化）。
+    """
+    normalized = []
+    for item in items:
+        new_item = dict(item)
+        new_item.setdefault("isolated", False)
+        new_item.setdefault("covering_fault_ids", [])
+        normalized.append(new_item)
+    return normalized
 
 
 def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
@@ -500,6 +541,10 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
     """
     sealed_interval = content["interval"]
     sealed_segments = sealed_interval["segments"]
+    # 旧封存包缺隔离字段：比较前归一化（不改写原包）
+    sealed_reading_items = _normalize_reading_items(
+        content["vehicle_readings"]
+    )
 
     if state.status == STATUS_UNCHANGED:
         ex = state.current_ex
@@ -550,7 +595,7 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
                 content["own_events"], own_now, "event_id"
             ),
             "vehicle_readings": _evidence_diff(
-                content["vehicle_readings"], read_now, "reading_id"
+                sealed_reading_items, read_now, "reading_id"
             ),
             "loading_windows": _loading_window_diff(
                 content["loading_windows"], load_now

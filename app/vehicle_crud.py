@@ -660,12 +660,17 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
             continue
         # 与货物报告同一套重建：必须含该货物**全部车次**的上下文——货物可能
         # 从上一车次带着未闭合越温区间装到本车次，此时自本车次装车时刻起即越温。
-        events, all_loadings, ctx_readings, effective = (
+        events, all_loadings, ctx_readings, effective, active_faults = (
             timeline.load_cargo_context(db, cargo_id)
         )
         event_eff, reading_eff = effective
         points = timeline.adopted_timeline(
-            events, ctx_readings, all_loadings, event_eff, reading_eff
+            events,
+            ctx_readings,
+            all_loadings,
+            event_eff,
+            reading_eff,
+            active_faults,
         )
         result = chain.rebuild_chain(
             cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
